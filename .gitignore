@@ -1,0 +1,36 @@
+# 工具缓存/配置（本地）
+.code-review-graph/
+.claude/
+.codebuddy/
+.gemini/
+.qoder/
+.mcp.json
+*.local
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 构建产物
+build/
+dist/
+*.ts4script
+!src/**/*.ts4script
+
+# 虚拟测试输出
+tools/__pycache__/
+
+# 本地工具链（Python 3.7 嵌入环境/安装包——测试用，不入库）
+tools/python37-embed/
+tools/python-3.7.9-amd64.exe
+tools/python-3.7.9-embed.zip
+tools/*.exe
+tools/*.zip
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

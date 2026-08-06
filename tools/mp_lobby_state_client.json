@@ -1,0 +1,50 @@
+{
+  "ts": 1786002374.5063746,
+  "is_host": false,
+  "my_player_id": 2,
+  "members": [
+    {
+      "player_id": 1,
+      "name": "测试玩家",
+      "ip": "",
+      "ready": false,
+      "in_lot": false,
+      "is_host": false,
+      "online": true,
+      "last_seen": 1786002371.5046465
+    },
+    {
+      "player_id": 2,
+      "name": "独立客户端",
+      "ip": "",
+      "ready": false,
+      "in_lot": false,
+      "is_host": false,
+      "online": true,
+      "last_seen": 1786002373.5232766
+    }
+  ],
+  "save_sync_phase": "idle",
+  "start_granted": false,
+  "room_code": "",
+  "room_visibility": "public",
+  "room_addr": "192.168.183.98;28.0.0.1",
+  "chat": [
+    {
+      "from": "me",
+      "text": "房主发言",
+      "ts": "15:46:14"
+    },
+    {
+      "from": "me",
+      "text": "房主发言",
+      "ts": "15:46:14"
+    },
+    {
+      "from": "房主",
+      "text": "反向消息",
+      "ts": "15:46:14"
+    }
+  ],
+  "discovered_rooms": {}
+}
