@@ -1,5 +1,5 @@
 {
-  "ts": 1786002374.5063746,
+  "ts": 1786026753.0766547,
   "is_host": false,
   "my_player_id": 2,
   "members": [
@@ -11,7 +11,7 @@
       "in_lot": false,
       "is_host": false,
       "online": true,
-      "last_seen": 1786002371.5046465
+      "last_seen": 1786026750.069642
     },
     {
       "player_id": 2,
@@ -21,29 +21,29 @@
       "in_lot": false,
       "is_host": false,
       "online": true,
-      "last_seen": 1786002373.5232766
+      "last_seen": 1786026752.0888407
     }
   ],
   "save_sync_phase": "idle",
   "start_granted": false,
   "room_code": "",
   "room_visibility": "public",
-  "room_addr": "192.168.183.98;28.0.0.1",
+  "room_addr": "192.168.0.112;28.0.0.1",
   "chat": [
     {
       "from": "me",
       "text": "房主发言",
-      "ts": "15:46:14"
+      "ts": "22:32:32"
     },
     {
       "from": "me",
       "text": "房主发言",
-      "ts": "15:46:14"
+      "ts": "22:32:32"
     },
     {
       "from": "房主",
       "text": "反向消息",
-      "ts": "15:46:14"
+      "ts": "22:32:33"
     }
   ],
   "discovered_rooms": {}

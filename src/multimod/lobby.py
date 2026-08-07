@@ -310,6 +310,22 @@ SAVES_DIR = os.path.join(os.path.expanduser("~"), "Documents", "Electronic Arts"
 SAVE_CHUNK_SIZE = 64 * 1024  # 64KB 每块（研究推荐值）
 
 
+def _pick_latest_save():
+    """v9.20.1: 选 Saves 目录最新 .save 文件（排除 .bak/备份）"""
+    try:
+        os.makedirs(SAVES_DIR, exist_ok=True)
+        saves = [f for f in os.listdir(SAVES_DIR)
+                 if f.endswith(".save") and not f.endswith(".bak")]
+        if not saves:
+            network._log("lobby: no save files in {}".format(SAVES_DIR))
+            return None
+        saves.sort(key=lambda f: os.path.getmtime(os.path.join(SAVES_DIR, f)), reverse=True)
+        return saves[0]
+    except Exception as e:
+        network._log("lobby pick save error: {}".format(e))
+        return None
+
+
 def host_send_save_file(filename):
     """房主发送存档文件给所有客户端（base64 分块）
 
@@ -462,6 +478,9 @@ def on_save_chunk_done(data):
         _notify("存档已接收并写入: {} ({:.1f}KB, 校验✅)".format(filename, len(raw) / 1024))
         network._log("lobby: save received and written {} ({}B, sha={})".format(
             filename, len(raw), actual[:12] if expect_sha else "n/a"))
+        # v9.20.1: 提示重新加载——游戏运行中无法热切换存档，
+        # 文件已就位但必须回主菜单读档才能生效（修复"同步了但游戏里没变"的另一半）
+        _notify("存档已同步! 请返回主菜单后重新加载存档 {}".format(filename))
         # 同步完成
         if network._client_socket is not None:
             network._send_json(network._client_socket, {"type": "save_sync_ack", "ok": True, "filename": filename})
@@ -989,8 +1008,25 @@ def host_start_save_sync(filename=None):
         ok, desc = host_send_save_file(filename)
         if not ok:
             _notify("存档发送失败: {}".format(desc))
+        else:
+            # v9.20.1: 发送成功后直接授予开始权（文件已真正同步）
+            global _start_granted
+            _save_sync_phase = "done"
+            _start_granted = True
+            _broadcast_state()
         return ok
-    # 旧流程：请求确认
+    # v9.20.1: 无 filename → 自动选 Saves 目录最新存档发送（修复"显示同步但存档没同步"）
+    auto_file = _pick_latest_save()
+    if auto_file:
+        ok, desc = host_send_save_file(auto_file)
+        if ok:
+            _save_sync_phase = "done"
+            _start_granted = True
+            _broadcast_state()
+        else:
+            _notify("存档发送失败: {}".format(desc))
+        return ok
+    # 完全无存档 → 旧确认流程（退化）
     _save_sync_phase = "waiting_ack"
     _save_sync_acks = set()
     network._broadcast({"type": "save_sync_req"})
@@ -1029,6 +1065,12 @@ def host_start_game():
         network._log("lobby: start blocked, not all in lot")
         return False
     network._broadcast({"type": "start_game"})
+    # v9.20.1: 同时广播时钟正常速度——客机被 clock hook 拦截无法自己解除暂停，
+    # 必须收到主机 clock 广播才会 apply_remote_clock（修复"主机开始了客机仍暂停"）
+    try:
+        network._send_clock_broadcast(1)
+    except Exception as e:
+        network._log("lobby: start clock broadcast error: {}".format(e))
     _notify("游戏开始!")
     network._log("lobby: game started")
     return True
@@ -1284,6 +1326,14 @@ def process_message(data, sender_pid=None):
             # 客户端收到开始指令
             _notify("房主已开始游戏!")
             network._log("lobby: game start received (client)")
+            # v9.20.1: 应用主机时钟（解除暂停）——修复"主机开始客机仍暂停"
+            try:
+                from multimod import clock_sync
+                speed = data.get("speed", 1)
+                clock_sync.apply_remote_clock(speed)
+                network._log("lobby: client clock applied speed={}".format(speed))
+            except Exception as e:
+                network._log("lobby: client clock apply error: {}".format(e))
             return
     except Exception as e:
         network._log("lobby process error: {}".format(e))
