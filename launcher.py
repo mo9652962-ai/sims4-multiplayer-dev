@@ -540,6 +540,9 @@ class LauncherApp(ctk.CTk):
                 "✅" if granted else "❌"), text_color=C["blue"])
 
         # v9.20.1: 按钮状态管理——按角色/存档阶段启用禁用
+        # v9.20.2: 打通两条同步链路——mp_syncsave(游戏内, 更新 mp_lobby_state.json 的 granted)
+        # 与 room_protocol 的 state 独立。若游戏同步已完成(granted)但 proto_state 未流转,
+        # 把 room_server.state 同步为 ROOM_SYNCED, 否则 start_btn 永远 disabled。
         try:
             is_room_protocol = bool(getattr(self, "room_server", None) or getattr(self, "room_client", None))
             if is_room_protocol:
@@ -548,14 +551,24 @@ class LauncherApp(ctk.CTk):
                 cli = getattr(self, "room_client", None)
                 proto_state = (srv or cli).state
                 proto_host = bool(srv)
+                # v9.20.2: 游戏内 mp_syncsave 同步完成后, 把 room_server.state 流转到 synced
+                if proto_host and granted and proto_state in ("waiting", "ready", "syncing"):
+                    try:
+                        self.room_server.state = "synced"
+                        proto_state = "synced"
+                        self._log("同步完成: mp_lobby_state.start_granted=True → room_server.state=synced")
+                    except Exception as e:
+                        self._log("⚠ 状态流转失败: {}".format(e))
                 self.sync_btn.configure(
                     state="normal" if proto_host else "disabled",
                     text="📦 同步存档" if proto_host else "📦 同步存档(需房主)",
                     fg_color="#242424" if proto_host else "#1A1A1A")
+                # v9.20.2: start 启用 = 房主 且 (proto synced/launching 或 游戏 granted)
+                can_start = proto_host and (proto_state in ("synced", "launching") or granted)
                 self.start_btn.configure(
-                    state="normal" if (proto_host and proto_state in ("synced", "launching")) else "disabled",
-                    text="🚀 开始游戏" if proto_host else "🚀 开始游戏(需房主)",
-                    fg_color=C["neon"] if proto_host else "#1A1A1A")
+                    state="normal" if can_start else "disabled",
+                    text="🚀 开始游戏" if can_start else "🚀 开始游戏(先同步存档)",
+                    fg_color=C["neon"] if can_start else "#1A1A1A")
             else:
                 # 游戏内 lobby 模式：按 save_sync_phase/start_granted 控制
                 if not is_host:
