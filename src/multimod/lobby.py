@@ -525,7 +525,13 @@ def schedule_reconnect_with_backoff(broken_sock=None):
             while attempts < 20:
                 time.sleep(delay)
                 # v9.19.1: socket 已被替换 → 已恢复，退出（防止误杀新连接）
-                if broken_sock is not None and net._client_socket is not broken_sock:
+                # v9.20.4: 修复回归——断线后 _client_socket 被清理为 None,
+                # None is not broken_sock 恒为 True → 首次检查就误判"已替换"而退出,
+                # 导致客机断线后永不重连(离线收不到主机广播)。只有 _client_socket
+                # 是"有效的新连接"(非 None 且非断线 socket) 才允许退出。
+                if (broken_sock is not None
+                        and net._client_socket is not None
+                        and net._client_socket is not broken_sock):
                     network._log("reconnect: socket replaced, skipping")
                     return
                 if net._client_socket is not None:

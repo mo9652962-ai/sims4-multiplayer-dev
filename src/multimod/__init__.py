@@ -24,7 +24,7 @@ def _log(msg):
         pass
 
 
-_log("=== v9.20.3 module loaded ===")
+_log("=== v9.20.4 module loaded ===")
 
 # 引入多模块
 from multimod import network  # noqa: F401
@@ -107,4 +107,4 @@ def _notify(text):
         _log("notify failed: {}".format(e))
 
 
-_log("=== v9.20.3 init complete ===")
+_log("=== v9.20.4 init complete ===")
