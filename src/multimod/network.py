@@ -933,18 +933,26 @@ def _server_thread(port=DEFAULT_PORT):
         while True:
             try:
                 conn, addr = _server_socket.accept()
-                # v9.20.4: 同 IP 去重——客机旧版/竞态双连接时只保留先到的,
-                # 否则同一客机占两个 pid, 旧连接 10053 断开 → 客机误判断线
+                # v9.20.4: 同 IP 去重——客机重连时旧连接可能已死(半开)却占用 _clients,
+                # 若拒绝新连接 → 客机永远连不上(重连风暴全部被拒)。
+                # 策略: 踢旧接新——关闭旧连接, 释放旧 pid, 接受新连接。
                 try:
                     with _clients_lock:
                         dup = [pid for pid, (s, a) in _clients.items() if a[0] == addr[0]]
                     if dup:
-                        _log("duplicate connection from {} (existing pid={}), rejecting".format(addr[0], dup[0]))
+                        old_pid = dup[0]
+                        _log("duplicate connection from {} (existing pid={}), replacing old".format(addr[0], old_pid))
                         try:
-                            conn.close()
+                            old_sock = _clients.get(old_pid, (None,))[0]
+                            if old_sock is not None:
+                                old_sock.close()
                         except Exception:
                             pass
-                        continue
+                        with _clients_lock:
+                            _clients.pop(old_pid, None)
+                            if old_pid not in _released_pids:
+                                _released_pids.append(old_pid)
+                        # 继续接受新连接（不 continue）
                 except Exception as e:
                     _log("dup check error: {}".format(e))
                 # v9.19: 禁止本机自连接（防 auto-apply 连接风暴掩盖真实客机）
