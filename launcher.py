@@ -24,7 +24,7 @@ import time
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
-APP_VERSION = "9.19"
+APP_VERSION = "9.20.1"
 APP_REPO = "mo9652962-ai/second-brain"  # v8.5: GitHub 自动更新检查源
 UPDATE_URL = "https://api.github.com/repos/{}/releases/latest".format(APP_REPO)
 DEFAULT_GAME_DIR = r"D:\Games\The Sims 4"
@@ -539,6 +539,41 @@ class LauncherApp(ctk.CTk):
                 {"idle": "未开始", "waiting_ack": "等待确认", "done": "已完成"}.get(phase, phase),
                 "✅" if granted else "❌"), text_color=C["blue"])
 
+        # v9.20.1: 按钮状态管理——按角色/存档阶段启用禁用
+        try:
+            is_room_protocol = bool(getattr(self, "room_server", None) or getattr(self, "room_client", None))
+            if is_room_protocol:
+                # 启动器房间模式：按钮按协议状态控制
+                srv = getattr(self, "room_server", None)
+                cli = getattr(self, "room_client", None)
+                proto_state = (srv or cli).state
+                proto_host = bool(srv)
+                self.sync_btn.configure(
+                    state="normal" if proto_host else "disabled",
+                    text="📦 同步存档" if proto_host else "📦 同步存档(需房主)",
+                    fg_color="#242424" if proto_host else "#1A1A1A")
+                self.start_btn.configure(
+                    state="normal" if (proto_host and proto_state in ("synced", "launching")) else "disabled",
+                    text="🚀 开始游戏" if proto_host else "🚀 开始游戏(需房主)",
+                    fg_color=C["neon"] if proto_host else "#1A1A1A")
+            else:
+                # 游戏内 lobby 模式：按 save_sync_phase/start_granted 控制
+                if not is_host:
+                    self.sync_btn.configure(state="disabled", text="📦 同步存档(需房主)", fg_color="#1A1A1A")
+                    self.start_btn.configure(state="disabled", text="🚀 开始游戏(需房主)", fg_color="#1A1A1A")
+                else:
+                    # 房主：同步按钮在 waiting_ack 时禁用；开始按钮需 granted
+                    if phase == "waiting_ack":
+                        self.sync_btn.configure(state="disabled", text="🔄 同步中...", fg_color="#1A1A1A")
+                    else:
+                        self.sync_btn.configure(state="normal", text="📦 同步存档(房主)", fg_color="#242424")
+                    if granted:
+                        self.start_btn.configure(state="normal", text="🚀 开始游戏", fg_color=C["neon"])
+                    else:
+                        self.start_btn.configure(state="disabled", text="🚀 先同步存档", fg_color="#1A1A1A")
+        except Exception:
+            pass
+
         # 成员列表（含在线状态，v8.3: Carbon 状态色规范）
         lines = ["{:<4} {:<16} {:<6} {:<6} {:<6} {:<6} {}".format("ID", "玩家", "准备", "进图", "在线", "状态", "身份"),
                  "-" * 58]
@@ -706,12 +741,26 @@ class LauncherApp(ctk.CTk):
         self._log("已发送离开房间指令")
 
     def _sync_save(self):
+        """v9.20.1: 房主同步存档——发出指令 + 立即刷新显示进度"""
         self._write_mp_cmd("mp_syncsave")
         self._log("已发送同步存档指令 (房主 mp_syncsave)")
+        # 立即把按钮置为"同步中"并安排刷新（mod 侧 v9.20.1 会自动发最新存档）
+        try:
+            self.sync_btn.configure(state="disabled", text="🔄 同步中...", fg_color="#1A1A1A")
+        except Exception:
+            pass
+        self.after(1500, self._refresh_room)
 
     def _start_game(self):
+        """v9.20.1: 房主开始游戏——发出指令 + 立即刷新显示"""
         self._write_mp_cmd("mp_start")
         self._log("已发送开始游戏指令 (房主 mp_start)")
+        # 立即反馈 + 短延时刷新（mod 侧广播 start_game + clock 解除客机暂停）
+        try:
+            self.start_btn.configure(state="disabled", text="🚀 已发送开始...", fg_color="#1A1A1A")
+        except Exception:
+            pass
+        self.after(1500, self._refresh_room)
 
     def _write_mp_cmd(self, cmd):
         """写命令文件（mod 轮询读取执行——启动器到游戏内命令桥）"""
