@@ -648,6 +648,33 @@ class LauncherApp(ctk.CTk):
             self.room_status.configure(
                 text=("🏠 我是房主" if is_host else "💻 我是成员") +
                 " | {}".format(state_names.get(state, state)), text_color=C["neon"])
+            # v9.20.2: 按钮状态控制 (房间模式真正执行的路径!)
+            # 之前写在了 _refresh_room() 游戏内分支, 房间模式 512 行 return 不执行 → 按钮永不更新
+            try:
+                # granted 兜底: 读游戏内 mp_syncsave 完成标志 (mp_lobby_state.json)
+                granted = False
+                try:
+                    st_path = os.path.join(MODS_DIR, "mp_lobby_state.json")
+                    with open(st_path, "r", encoding="utf-8") as f:
+                        st = json.load(f)
+                    granted = bool(st.get("start_granted", False))
+                except Exception:
+                    pass
+                if is_host:
+                    # 房主: 同步按钮随时可点; 开始按钮需 synced/launching 或游戏 granted
+                    self.sync_btn.configure(state="normal", text="📦 同步存档(房主)",
+                                            fg_color="#242424")
+                    can_start = state in ("synced", "launching") or granted
+                    self.start_btn.configure(
+                        state="normal" if can_start else "disabled",
+                        text="🚀 开始游戏" if can_start else "🚀 先同步存档",
+                        fg_color=C["neon"] if can_start else "#1A1A1A")
+                else:
+                    # 成员: 两者都禁用 (等房主)
+                    self.sync_btn.configure(state="disabled", text="📦 同步存档(需房主)", fg_color="#1A1A1A")
+                    self.start_btn.configure(state="disabled", text="🚀 开始游戏(需房主)", fg_color="#1A1A1A")
+            except Exception as e:
+                self._log("⚠ 按钮状态更新异常: {}".format(e))
             # 成员列表
             lines = ["{:<4} {:<14} {:<6} {}".format("ID", "玩家", "准备", "身份"),
                      "-" * 42]
