@@ -831,19 +831,27 @@ def _recv_loop(sock, is_client=False, player_id=None):
                 lobby.schedule_reconnect_with_backoff(broken_sock=sock)
             except Exception as e:
                 _log("reconnect schedule error: {}".format(e))
-    elif player_id is not None and player_id in _clients:
+    elif player_id is not None:
         # 客户端断开 → 从成员列表移除 + 广播房间状态
+        # v9.20.4: 必须验证 _clients[player_id] 的 socket 就是当前 sock——
+        # 踢旧接新后旧连接线程醒来时 pid 已被新连接复用, 若只按 pid 清理
+        # 会把新连接误删 → 客机重连风暴(连接建立后即被旧线程杀死)。
         _log("client disconnected: pid={}".format(player_id))
+        disconnected = False
         with _clients_lock:  # v9.3: 并发安全（研究: 多客户端共享状态需 Lock）
-            _clients.pop(player_id, None)
-            # v9.12: player_id 复用池（重连复用原 ID，防递增→KeyError）
-            if player_id not in _released_pids:
-                _released_pids.append(player_id)
-        try:
-            from multimod import lobby
-            lobby.on_client_disconnect(player_id)
-        except Exception as e:
-            _log("lobby disconnect error: {}".format(e))
+            cur = _clients.get(player_id)
+            if cur is not None and cur[0] is sock:
+                _clients.pop(player_id, None)
+                # v9.12: player_id 复用池（重连复用原 ID，防递增→KeyError）
+                if player_id not in _released_pids:
+                    _released_pids.append(player_id)
+                disconnected = True
+        if disconnected:
+            try:
+                from multimod import lobby
+                lobby.on_client_disconnect(player_id)
+            except Exception as e:
+                _log("lobby disconnect error: {}".format(e))
 
 
 def _handle_client(conn, addr):

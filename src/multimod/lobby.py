@@ -46,6 +46,7 @@ _save_sync_acks = set()
 _start_granted = False       # 存档同步完成后所有成员获得开始权
 _player_name = "玩家"
 _last_broadcast_state = None
+_reconnect_in_progress = False  # v9.20.4: 重连循环防重入（断线风暴时避免循环叠加）
 
 # M3d 增强（十轮研究 2026-08-04）:
 # - 房间码: 房主建房生成 6 位短码，加入者输码免输 IP
@@ -514,73 +515,85 @@ def schedule_reconnect_with_backoff(broken_sock=None):
     本调度必须退出，绝不能 close 新连接（旧 bug：cli1 断线触发的
     调度 1.5s 后醒来误杀 cli2 的新连接）。
     """
-    global _last_known_host_ip
+    global _last_known_host_ip, _reconnect_in_progress
+    # v9.20.4: 防重入——断线风暴时 _recv_loop 每次断线都调度新循环,
+    # 旧循环未结束又起新循环 → attempts 永远 1/20, 指数退避从未累计。
+    # 已有循环在跑则跳过 (循环内部会持续重试直到成功/耗尽)。
+    if _reconnect_in_progress:
+        network._log("reconnect: loop already running, skip")
+        return
+    _reconnect_in_progress = True
     try:
         import threading
         from multimod import network as net
 
         def _reconnect_loop():
-            delay = 1.5
-            attempts = 0
-            while attempts < 20:
-                time.sleep(delay)
-                # v9.19.1: socket 已被替换 → 已恢复，退出（防止误杀新连接）
-                # v9.20.4: 修复回归——断线后 _client_socket 被清理为 None,
-                # None is not broken_sock 恒为 True → 首次检查就误判"已替换"而退出,
-                # 导致客机断线后永不重连(离线收不到主机广播)。只有 _client_socket
-                # 是"有效的新连接"(非 None 且非断线 socket) 才允许退出。
-                if (broken_sock is not None
-                        and net._client_socket is not None
-                        and net._client_socket is not broken_sock):
-                    network._log("reconnect: socket replaced, skipping")
-                    return
-                if net._client_socket is not None:
-                    # v9.19: 如果网络线程已停止 → 强制允许重连
-                    if net._network_thread and net._network_thread.is_alive():
-                        network._log("reconnect: already connected, skipping")
+            global _reconnect_in_progress
+            try:
+                delay = 1.5
+                attempts = 0
+                while attempts < 20:
+                    time.sleep(delay)
+                    # v9.19.1: socket 已被替换 → 已恢复，退出（防止误杀新连接）
+                    # v9.20.4: 修复回归——断线后 _client_socket 被清理为 None,
+                    # None is not broken_sock 恒为 True → 首次检查就误判"已替换"而退出,
+                    # 导致客机断线后永不重连(离线收不到主机广播)。只有 _client_socket
+                    # 是"有效的新连接"(非 None 且非断线 socket) 才允许退出。
+                    if (broken_sock is not None
+                            and net._client_socket is not None
+                            and net._client_socket is not broken_sock):
+                        network._log("reconnect: socket replaced, skipping")
                         return
-                    # 线程死了但 socket 还在（recv_loop 未及时清理）→ 重置后重连
-                    network._log("reconnect: stale socket, resetting")
+                    if net._client_socket is not None:
+                        # v9.19: 如果网络线程已停止 → 强制允许重连
+                        if net._network_thread and net._network_thread.is_alive():
+                            network._log("reconnect: already connected, skipping")
+                            return
+                        # 线程死了但 socket 还在（recv_loop 未及时清理）→ 重置后重连
+                        network._log("reconnect: stale socket, resetting")
+                        try:
+                            net._client_socket.close()
+                        except Exception:
+                            pass
+                        net._client_socket = None
+                    host_ip = _last_known_host_ip or claim_get_host_ip()
+                    if not host_ip or host_ip == "127.0.0.1":
+                        network._log("reconnect: no host ip")
+                        return
+                    attempts += 1
                     try:
-                        net._client_socket.close()
-                    except Exception:
-                        pass
-                    net._client_socket = None
-                host_ip = _last_known_host_ip or claim_get_host_ip()
-                if not host_ip or host_ip == "127.0.0.1":
-                    network._log("reconnect: no host ip")
-                    return
-                attempts += 1
-                try:
-                    network._log("reconnect attempt {}/{} to {}:{} (delay {:.1f}s)".format(
-                        attempts, 20, host_ip, net.DEFAULT_PORT, delay))
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(3)
-                    sock.connect((host_ip, net.DEFAULT_PORT))
-                    sock.settimeout(None)
-                    net._client_socket = sock
-                    network._log("reconnect: connected to {}:{}".format(host_ip, net.DEFAULT_PORT))
-                    _notify("已重连主机")
-                    # 重新握手 hello
-                    try:
-                        net._send_json(sock, {"type": "hello", "name": _get_player_name(),
-                                              "password": "",
-                                              "proto_version": net.PROTO_VERSION})
-                    except Exception:
-                        pass
-                    net._ensure_alarm()
-                    import threading as _t
-                    _t.Thread(target=net._recv_loop, args=(sock, True), daemon=True).start()
-                    return
-                except Exception as e:
-                    network._log("reconnect attempt failed: {}".format(e))
-                # v9.4: 指数退避 + jitter（研究: AWS 防 thundering herd——
-                # 多客户端同步重试会同时冲击主机，随机 ±20% 打散）
-                # 1.5 → 3 → 6 → 12 → 24 → 48 → 60 cap
-                delay = min(delay * 2, 60.0) * random.uniform(0.8, 1.2)
-            # 重连失败 → 触发主机迁移竞选
-            network._log("reconnect exhausted, triggering host migration")
-            on_host_disconnect()
+                        network._log("reconnect attempt {}/{} to {}:{} (delay {:.1f}s)".format(
+                            attempts, 20, host_ip, net.DEFAULT_PORT, delay))
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(3)
+                        sock.connect((host_ip, net.DEFAULT_PORT))
+                        sock.settimeout(None)
+                        net._client_socket = sock
+                        network._log("reconnect: connected to {}:{}".format(host_ip, net.DEFAULT_PORT))
+                        _notify("已重连主机")
+                        # 重新握手 hello
+                        try:
+                            net._send_json(sock, {"type": "hello", "name": _get_player_name(),
+                                                  "password": "",
+                                                  "proto_version": net.PROTO_VERSION})
+                        except Exception:
+                            pass
+                        net._ensure_alarm()
+                        import threading as _t
+                        _t.Thread(target=net._recv_loop, args=(sock, True), daemon=True).start()
+                        return
+                    except Exception as e:
+                        network._log("reconnect attempt failed: {}".format(e))
+                    # v9.4: 指数退避 + jitter（研究: AWS 防 thundering herd——
+                    # 多客户端同步重试会同时冲击主机，随机 ±20% 打散）
+                    # 1.5 → 3 → 6 → 12 → 24 → 48 → 60 cap
+                    delay = min(delay * 2, 60.0) * random.uniform(0.8, 1.2)
+                # 重连失败 → 触发主机迁移竞选
+                network._log("reconnect exhausted, triggering host migration")
+                on_host_disconnect()
+            finally:
+                # v9.20.4: 循环结束(成功/耗尽/退出) → 允许下次调度
+                _reconnect_in_progress = False
 
         threading.Thread(target=_reconnect_loop, daemon=True).start()
     except Exception as e:
