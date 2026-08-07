@@ -554,8 +554,8 @@ class LauncherApp(ctk.CTk):
                 # v9.20.2: 游戏内 mp_syncsave 同步完成后, 把 room_server.state 流转到 synced
                 if proto_host and granted and proto_state in ("waiting", "ready", "syncing"):
                     try:
-                        self.room_server.state = "synced"
-                        proto_state = "synced"
+                        self.room_server.state = ROOM_SYNCED
+                        proto_state = ROOM_SYNCED
                         self._log("同步完成: mp_lobby_state.start_granted=True → room_server.state=synced")
                     except Exception as e:
                         self._log("⚠ 状态流转失败: {}".format(e))
