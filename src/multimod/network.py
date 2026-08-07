@@ -49,6 +49,7 @@ _server_socket = None
 _my_player_id = 0            # 本机 player_id（主机=0，客机=主机分配）
 _clients = {}                # 主机模式：player_id -> (sock, addr) 多客户端管理
 _clients_lock = threading.Lock()  # v9.3: 多客户端共享状态锁（研究: 并发连接需 Lock）
+_client_connecting = False   # v9.20.4: 客机防双连接——mp_join/auto-apply 双触发竞态
 _next_player_id = 1          # 主机分配 player_id（0 = 房主自己）
 _released_pids = []          # v9.12: 释放的 player_id 复用池（防重连 ID 递增→KeyError）
 
@@ -932,6 +933,20 @@ def _server_thread(port=DEFAULT_PORT):
         while True:
             try:
                 conn, addr = _server_socket.accept()
+                # v9.20.4: 同 IP 去重——客机旧版/竞态双连接时只保留先到的,
+                # 否则同一客机占两个 pid, 旧连接 10053 断开 → 客机误判断线
+                try:
+                    with _clients_lock:
+                        dup = [pid for pid, (s, a) in _clients.items() if a[0] == addr[0]]
+                    if dup:
+                        _log("duplicate connection from {} (existing pid={}), rejecting".format(addr[0], dup[0]))
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        continue
+                except Exception as e:
+                    _log("dup check error: {}".format(e))
                 # v9.19: 禁止本机自连接（防 auto-apply 连接风暴掩盖真实客机）
                 # 仅允许 --allow-self 调试模式时通过
                 if addr[0] == "127.0.0.1" and not ALLOW_SELF:
@@ -963,7 +978,14 @@ def _server_thread(port=DEFAULT_PORT):
 
 
 def _client_thread(host, port=DEFAULT_PORT):
-    global _client_socket, _my_player_id
+    global _client_socket, _my_player_id, _client_connecting
+    # v9.20.4: 防双连接——mp_join 与 auto-apply 可能同时触发两个连接线程,
+    # 后启动的覆盖 _client_socket → 主机端同 IP 双连接 → 旧连接 10053 断开
+    # → 客机指向已断连接 → 误判断线。已有连接线程在跑则跳过。
+    if _client_connecting:
+        _log("client thread: already connecting, skip duplicate")
+        return
+    _client_connecting = True
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         # v8.0: TCP_NODELAY 禁用 Nagle（研究: 低延迟优先于带宽）
@@ -1029,6 +1051,9 @@ def _client_thread(host, port=DEFAULT_PORT):
             lobby.schedule_reconnect_with_backoff()
         except Exception as re_err:
             _log("connect reconnect schedule error: {}".format(re_err))
+    finally:
+        # v9.20.4: 无论连接成功/失败/断线, 重置防双连接标志 (允许后续重连)
+        _client_connecting = False
 
 
 @sims4.commands.Command('mp_host', command_type=sims4.commands.CommandType.Live)
