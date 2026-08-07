@@ -1260,6 +1260,29 @@ class LauncherApp(ctk.CTk):
                 pwd = self.join_pwd_var.get().strip()
             self.room_client = RoomClient(host, port=7660, name=name, room_code=room_code, password=pwd)
             self.room_client.on("rejected", lambda d: self._log("❌ {}".format(d.get("reason", "被拒绝"))))
+            # v9.20.4: 成员监听房主「开始游戏」广播 → 自动写 join 配置 + 启动游戏
+            # (之前只显示 launching 状态却不启动游戏, 导致成员只能手动开且无法同步)
+            def _on_game_start(msg):
+                try:
+                    self._log("🚀 房主已开始游戏，正在自动启动...")
+                    if msg.get("save_name"):
+                        self._log("📦 同步存档: {}".format(msg["save_name"]))
+                    self.after(500, self._start_game_after_room)
+                except Exception as e:
+                    self._log("❌ 自动启动失败: {}".format(e))
+            self.room_client.on("game_start", _on_game_start)
+            # v9.20.4: 成员收到存档 → 立即写入 Saves 目录 (否则游戏内无档可同步)
+            def _on_save_received(msg):
+                try:
+                    saves_dir = os.path.join(DOCS_DIR, "Saves")
+                    ok, path = self.room_client.save_to(saves_dir)
+                    if ok:
+                        self._log("✅ 存档已写入: {}".format(os.path.basename(path)))
+                    else:
+                        self._log("❌ 存档写入失败: {}".format(path))
+                except Exception as e:
+                    self._log("❌ 存档写入异常: {}".format(e))
+            self.room_client.on("save_received", _on_save_received)
             ok, err = self.room_client.connect()
             if not ok:
                 self._log("❌ {}".format(err))
