@@ -1,7 +1,13 @@
 # Sims4Multiplayer — 自制模拟人生联机 mod
 
-> 从零开始的自制 Sims 4 联机 mod（Python 3.7 脚本 + TCP 网络层）
+> **Sims4Multiplayer 是自研的《模拟人生 4》联机 mod（SimSync），用 Python 3.7 脚本 + TCP 网络层为单人游戏加入多人同步——从零反编译游戏 API、自制协议、无第三方库依赖。**
 > 项目启动：2026-08-03 · 开发者：sora + k (Hermes)
+
+<p>
+  <img src="https://img.shields.io/badge/status-开发中-2563EB?style=flat-square" alt="开发中">
+  <img src="https://img.shields.io/badge/python-3.7-3776AB?style=flat-square" alt="Python 3.7">
+  <img src="https://img.shields.io/badge/protocol-TCP--JSON-16A34A?style=flat-square" alt="TCP/JSON">
+</p>
 
 ---
 
@@ -112,3 +118,26 @@ uncompyle6.exe simulation/services/cheat_service.pyc > out.py
 ---
 
 *Sims4Multiplayer · 从 S4MP 启发自制 · 2026-08-03*
+
+## 常见问题（FAQ）
+
+**Q: 需要什么游戏版本？**
+完整版《模拟人生 4》（非阉割版）+ 对应版本的游戏 API。项目基于解压出的 base/core/simulation zip 反编译。
+
+**Q: 怎么启动联机？**
+运行 （或 launcher.py）→ 主机用 、加入者用 。
+
+**Q: 协议是自己写的吗？**
+是。TCP + JSON 自定义协议（room_protocol.py）——参考 S4MP 思路，但实现完全自研。
+
+**Q: 目前能同步什么？**
+M1 聊天已完整同步（mp_say）；M2 位置同步在骨架阶段（mp_sync/mp_target 已写，游戏内 API 待迭代）。
+
+**Q: 代码可以商用吗？**
+本项目为学习用途（GPL-3.0）——涉及游戏文件仅供研究，请勿传播游戏本体。
+
+## 更新日志
+
+- 2026-08-07：M2 位置同步骨架 + 协议演进（帧头升级连锁 + HMAC 握手）
+- 2026-08-05：M1 聊天同步完整（TCP/JSON + mp_say）
+- 2026-08-03：M0 环境搭建 + Hello World 验证打包链路
