@@ -51,7 +51,7 @@ def _out(msg, _connection=None):
 def _iter_lot_objects():
     """遍历地段内对象（排除 sim）"""
     try:
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         zone = services.current_zone()
         if zone is None:
             return []
@@ -141,7 +141,7 @@ def process_message(data):
         obj_id = int(data.get("obj_id", 0))
         if not obj_id:
             return
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         obj = services.object_manager().get(obj_id)
         if obj is None:
             return

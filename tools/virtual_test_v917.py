@@ -182,6 +182,10 @@ class _Svc:
     client_manager = None
     instance_mgr = {}
 sys.modules['sims4'].services = _Svc()
+# v9.21.1: 真实游戏的 services 是顶层模块（游戏代码 import services），
+# 必须同时装进 sys.modules['services']——否则 import services 会生成空真模块，
+# 所有 apply 路径静默失败（A5/B2/C3/D5 类断言全挂）
+sys.modules['services'] = sys.modules['sims4'].services
 
 class FakeSimInfoManager:
     def __init__(self): self.map = {}

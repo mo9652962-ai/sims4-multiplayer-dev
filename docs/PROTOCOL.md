@@ -73,8 +73,26 @@
 | `travel_ack` | C→H | ts | 确认旅行就绪 |
 | `travel_go` | H→C | ts | 全员放行 |
 | `travel_arrived` | C→H | player, zone_id | 抵达新场景报告（v9.11）|
+| `travel_follow` | H→C | zone_id | 主机旅行跟随（v9.24）：主机 zone 变化 → 广播全员自动跟随 |
 | `travel_all_arrived` | H→C | ts | 全员抵达确认（v9.11）|
 | `travel_missing` | H→C | missing | 旅行超时提示（v9.11）|
+
+> **v9.22 共同旅行增强**（S4MP 无此功能）：
+> - 客机收到 `travel_req` 默认**自动确认**（`mp_travel_auto` 可关，启动器可切）
+> - 进图时（in_lot False→True）且旅行锁定中**自动上报** `travel_arrived`
+>   （原实现只能手动 `mp_travel_arrived`，实际对局没人输）
+> - go 后 **30/60/90s 分级检查**：30/60s 广播进度（在等谁），90s 才超时解锁
+> - 全员抵达后向所有客机**刷新 world_snapshot**（新场景位置/资金基准对齐）
+> - `lobby` 广播与状态文件新增 `travel` 状态板（arrived/pending/auto_ack）
+>
+> **v9.23 旅行时钟锁定**：`travel_go` 时主机广播 `clock PAUSED` 并记住原速，
+> 全员到齐 / 90s 超时后自动恢复原速——场景加载期间客机无法处理 tick，
+> 锁时钟防止加载后时间漂移。
+>
+> **v9.23 周期状态自愈**：主机每 30s（`STATE_REFRESH_INTERVAL`）重播当前
+> 时钟速度——丢失的 clock 更新由下一周期重播自愈（客机 apply 幂等）。
+> 另：主线程每 tick 最多处理 `MAX_MSGS_PER_TICK=200` 条消息（防洪泛卡帧，
+> 余量顺延下一 tick）；网络线程看门狗每 10s 检查线程存活，死亡自动重启。
 
 ### 同步数据（6）
 | 类型 | 方向 | 字段 | 用途 |
@@ -118,9 +136,26 @@
 房主收到下列消息时，若 `sender_pid` 不是 0/None（即来自客机）则**直接丢弃**，
 防恶意客机冒充房主踢人 / 强改时钟 / 伪造存档同步完成：
 
-`welcome`、`kicked`、`start_game`、`clock_sync`、`save_sync_req`、`save_chunk`、
+`welcome`、`kicked`、`start_game`、`clock`、`save_sync_req`、`save_chunk`、
 `save_chunk_done`、`save_sync_done`、`travel_go`、`travel_all_arrived`、
 `travel_missing`、`host_migrated`、`version_mismatch`、`join_rejected`、`world_snapshot`
+
+> v9.22 修复：原列表中 `clock_sync` 是笔误（线上消息类型为 `clock`）——
+> 白名单此前从未对时钟消息生效，恶意客机可改主机时间。
+
+### 握手前帧上限（v9.22）
+会话密钥派生**之前**的连接（未认证态）只接受 **≤4KB** 的帧（`_PRE_AUTH_MAX_FRAME`），
+超大帧直接丢弃并记日志。说明：消息类型须反序列化后才能看到，类型白名单挡不住
+pickle 反序列化本身；大小上限才能限制注入载荷规模。语义级防护由 HOST_ONLY
+白名单在 `_process_incoming` 兜底。完整修复需协议 v3 将消息类型提升到帧头明文区。
+
+### 会话密钥生命周期（v9.22 更新）
+- host 的 `host_nonce` **按连接独立生成**（`_conn_nonces[pid]`）——原实现用模块级
+  全局 `_my_nonce`，两客机并发握手时后一个连接覆盖前一个的 nonce，先完成握手的
+  客机派生出错误 key → HMAC mismatch 静默丢帧
+- 客机端验签修复：原实现查 `_hmac_keys.get(None)` 恒为空 → 客机对主机帧的
+  HMAC 验证从未真正生效；现按本机 `player_id` 查 key
+- `_hmac_keys[pid]` 与 `_conn_nonces[pid]` 在断开 / 踢旧接新时同步清理
 
 ### 流控上限
 | 常量 | 值 | 作用 |
@@ -134,11 +169,6 @@
 一帧由两次 `sendall`（44 字节帧头 + pickle 数据）写出，多线程并发发往同一
 socket 会交错拼出撕裂帧（收端 CRC/HMAC 失败静默丢帧）。`_send_json` 按
 socket 粒度加锁（`_get_send_lock`），连接结束时 `_drop_send_lock` 清理。
-
-### 会话密钥生命周期（v9.21）
-`_hmac_keys[pid]` 在客户端断开 / 踢旧接新时清理。不清理会导致：
-① 字典随连接数无界增长；② pid 被新连接复用后，新客机握手派生新 key 之前
-收端用旧 key 验签 → HMAC mismatch 静默丢帧。
 
 ## 版本兼容规则
 

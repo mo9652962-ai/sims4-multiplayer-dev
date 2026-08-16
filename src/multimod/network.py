@@ -49,6 +49,16 @@ _server_socket = None
 _my_player_id = 0            # 本机 player_id（主机=0，客机=主机分配）
 _clients = {}                # 主机模式：player_id -> (sock, addr) 多客户端管理
 _clients_lock = threading.Lock()  # v9.3: 多客户端共享状态锁（研究: 并发连接需 Lock）
+_sock_pid_index = {}        # v9.22: id(sock) -> player_id 反向索引（_sock_to_pid
+                            # 原实现每次发帧线性扫描 _clients——多客机高频广播时
+                            # O(N) 每帧 × N 客机 = O(N²)；改哈希查 O(1)）
+_conn_nonces = {}           # v9.22: pid -> 本连接 host_nonce（每连接独立）。
+                            # 原实现用模块级全局 _my_nonce：两客机并发握手时后一个
+                            # 连接线程覆盖前一个的 nonce → 先完成握手的客机派生出
+                            # 错误 key → HMAC mismatch 静默丢帧（并发加入即中招）。
+
+# v9.22 P1: 握手前（会话密钥派生前）帧大小上限——未认证连接只接受 ≤4KB 的帧
+_PRE_AUTH_MAX_FRAME = 4 * 1024
 _client_connecting = False   # v9.20.4: 客机防双连接——mp_join/auto-apply 双触发竞态
 _next_player_id = 1          # 主机分配 player_id（0 = 房主自己）
 _released_pids = []          # v9.12: 释放的 player_id 复用池（防重连 ID 递增→KeyError）
@@ -70,13 +80,28 @@ MAX_BATCH_MSGS = 256
 # v9.21 P0-4: 入站队列上限——洪泛攻击/对端异常高频发送时队列无界增长 → 内存耗尽
 MAX_INCOMING_QUEUE = 4096
 
+# v9.23: 每 tick 消息处理预算——主线程 alarm 每 500ms 消费一次队列，原实现
+# 一次性排空全部；对端突发 4096 条时这一 tick 会卡游戏帧（真实游戏引擎的
+# fixed budget 模式：每 tick 固定工作量，余量顺延下一 tick）。
+MAX_MSGS_PER_TICK = 200
+
+# v9.23: 周期性状态刷新（研究: authoritative periodic snapshot / eventual
+# consistency——OneUptime 游戏状态同步 + GamedevSE full-vs-delta 讨论）。
+# 主机每 30s 重播权威时钟速度：任何丢失的 clock 更新在下一周期自愈
+# （客机 apply 幂等，速度一致时 no-op）。
+STATE_REFRESH_INTERVAL = 30.0
+_last_state_refresh = 0.0
+
 # v9.21 P0-5: 房主专属消息白名单——这些消息只能由房主(pid=0)下发，
 # 客机发来即丢弃（防恶意客机冒充房主踢人/改时钟/强制开始游戏）
+# v9.22 修复: 原列表里是 "clock_sync" 而线上消息类型是 "clock"——白名单从未
+# 生效，恶意客机仍可下发 clock 改主机时间。按实际消息名修正。
 HOST_ONLY_TYPES = frozenset([
-    "welcome", "kicked", "start_game", "clock_sync", "save_sync_req",
+    "welcome", "kicked", "start_game", "clock", "save_sync_req",
     "save_chunk", "save_chunk_done", "save_sync_done", "travel_go",
     "travel_all_arrived", "travel_missing", "host_migrated",
     "version_mismatch", "join_rejected", "world_snapshot",
+    "travel_follow",
 ])
 
 # v9.12: 协议版本协商（研究: MCP handshake / QUIC RFC 9368 兼容协商）
@@ -138,8 +163,12 @@ def _notify(text):
 
 
 def _process_incoming():
-    """处理收到的消息（游戏主线程调用）"""
-    while True:
+    """处理收到的消息（游戏主线程调用）
+
+    v9.23: 每 tick 最多处理 MAX_MSGS_PER_TICK 条——防突发洪泛卡死游戏帧，
+    余量顺延下一 tick（500ms 后），队列上限 4096 仍兜底内存。
+    """
+    for _ in range(MAX_MSGS_PER_TICK):
         try:
             item = _incoming_queue.get_nowait()
         except queue.Empty:
@@ -240,8 +269,9 @@ def _process_incoming():
                 except Exception as e:
                     _log("stats sync err: {}".format(e))
             elif mtype in ("travel_req", "travel_ack", "travel_go",
-                           "travel_arrived", "travel_all_arrived", "travel_missing"):
-                # v8.3 + v9.11: 旅行双端确认 + 场景切换抵达报告
+                           "travel_arrived", "travel_all_arrived", "travel_missing",
+                           "travel_follow"):
+                # v8.3 + v9.11 + v9.24: 旅行双端确认 + 场景切换抵达报告 + 游戏内旅行跟随
                 # (研究: S4MP 0.5.2 无限加载修复 / SimSync travel together)
                 try:
                     from multimod import lobby
@@ -255,6 +285,8 @@ def _process_incoming():
                         lobby.on_travel_arrived(sender_pid, data.get("zone_id"))
                     elif mtype == "travel_all_arrived":
                         lobby.on_travel_all_arrived(data)
+                    elif mtype == "travel_follow":
+                        lobby.on_travel_follow(data)
                     else:
                         lobby.on_travel_missing(data)
                 except Exception as e:
@@ -373,12 +405,9 @@ def _derive_hmac_key(room_password, client_nonce, host_nonce):
 
 
 def _sock_to_pid(sock):
-    """反查 socket → player_id（多客户端时按目标选 key）"""
+    """反查 socket → player_id（v9.22: 反向索引 O(1)，随 _clients 同锁维护）"""
     with _clients_lock:
-        for _pid, (_sock, _addr) in list(_clients.items()):
-            if _sock is sock:
-                return _pid
-    return None
+        return _sock_pid_index.get(id(sock))
 
 
 def _sign_frame(payload_data, key=None):
@@ -480,6 +509,90 @@ def get_health_label():
 # ============ 自动消息处理 (alarm 循环, 游戏主线程) ============
 _ALARM_INTERVAL_MS = 500
 _process_alarm_handle = None
+_host_port = DEFAULT_PORT       # v9.23: 看门狗重启 server 线程用
+_last_watchdog_check = 0.0      # v9.23: 看门狗节流（10s 一次）
+
+
+def _periodic_state_refresh():
+    """v9.23: 周期性权威状态刷新（主机）。
+
+    研究: authoritative periodic snapshot → eventual consistency——
+    丢失/乱序的 clock 更新由下一周期重播自愈；客机 apply 幂等
+    （速度一致时 no-op），刷新对稳态零副作用。
+    """
+    global _last_state_refresh
+    if not _is_host:
+        return
+    now = time.time()
+    if now - _last_state_refresh < STATE_REFRESH_INTERVAL:
+        return
+    _last_state_refresh = now
+    try:
+        from multimod import clock_sync
+        speed = clock_sync.get_current_speed()
+        if speed is not None:
+            _send_clock_broadcast(speed)
+            _log("state refresh: clock speed={}".format(int(speed)))
+    except Exception as e:
+        _log("state refresh error: {}".format(e))
+
+
+def _network_watchdog():
+    """v9.23: 网络线程看门狗——server/client 线程意外死亡（异常逃出外层
+    except）时自动重启，避免"房主还在游戏里但没人能连"的僵死状态。
+    每 10s 检查一次（在主线程 alarm 里调用，无额外线程）。
+    """
+    global _last_watchdog_check, _network_thread
+    now = time.time()
+    if now - _last_watchdog_check < 10.0:
+        return
+    _last_watchdog_check = now
+    try:
+        if _is_host:
+            # 主机：server socket 还开着但线程死了 → 重启监听
+            if _server_socket is not None and (_network_thread is None or not _network_thread.is_alive()):
+                _log("watchdog: host network thread dead, restarting server :{}".format(_host_port))
+                _network_thread = threading.Thread(
+                    target=_server_thread, args=(_host_port,), daemon=True)
+                _network_thread.start()
+        else:
+            # 客机：无连接、无连接进行中、线程死 → 调度重连
+            if (_client_socket is None and not _client_connecting
+                    and (_network_thread is None or not _network_thread.is_alive())):
+                from multimod import lobby
+                lobby.schedule_reconnect_with_backoff()
+                _log("watchdog: client dead, reconnect scheduled")
+    except Exception as e:
+        _log("watchdog error: {}".format(e))
+
+
+# ============ v9.24: 主机游戏内旅行检测（zone 变化 → 全员自动跟随） ============
+_last_zone_id = None
+
+
+def _check_zone_change():
+    """v9.24: 主机每 tick 检查当前 zone——玩家在游戏里发起旅行(手机/地图/点地块)
+    时 zone_id 变化 → 通知 lobby 广播 travel_follow，成员自动跟随到同一地点。
+    首次读数只做基线（游戏启动后的首次进图不算旅行）。"""
+    global _last_zone_id
+    if not _is_host:
+        return
+    try:
+        import services
+        zid = services.current_zone_id()
+        if zid is None:
+            return
+        if _last_zone_id is None:
+            _last_zone_id = zid
+            return
+        if zid != _last_zone_id:
+            old = _last_zone_id
+            _last_zone_id = zid
+            _log("zone changed: {} -> {} (host in-game travel)".format(old, zid))
+            from multimod import lobby
+            lobby.on_host_zone_changed(zid)
+    except Exception as e:
+        _log("zone check error: {}".format(e))
 
 
 def _process_alarm_callback(_alarm_handle):
@@ -489,12 +602,15 @@ def _process_alarm_callback(_alarm_handle):
     _check_lot_status()  # M3d: 进图门槛检测
     _check_launcher_cmd()  # M3d: 启动器按钮 → 游戏内命令桥
     _check_heartbeats()  # M3d 增强: 主机心跳超时检测
+    _periodic_state_refresh()  # v9.23: 周期状态自愈
+    _network_watchdog()  # v9.23: 网络线程看门狗
+    _check_zone_change()  # v9.24: 主机游戏内旅行检测
     return True  # 持续循环
 
 
 def _on_tick_callback():
     """v9.19: core_services.on_tick 回调（替代 alarm——S4MP CoreServicesHooks 风格）
-    
+
     由 core_hooks._on_game_tick() 每 500ms 调用一次。
     与 _process_alarm_callback 等效，但不依赖 TimeService。
     """
@@ -503,6 +619,9 @@ def _on_tick_callback():
     _check_lot_status()
     _check_launcher_cmd()
     _check_heartbeats()
+    _periodic_state_refresh()  # v9.23
+    _network_watchdog()  # v9.23
+    _check_zone_change()  # v9.24
 
 
 # ============ M3d 增强: 心跳检查（主机侧，每 500ms 由 alarm 调用） ============
@@ -563,6 +682,14 @@ def _check_launcher_cmd():
             from multimod import lobby
             lobby.leave_room()
             _notify("已离开房间")
+        elif cmd == "mp_travel":
+            # v9.22: 启动器"共同旅行"按钮 → 房主发起旅行同步
+            from multimod import lobby
+            lobby.host_start_travel()
+        elif cmd == "mp_travel_auto":
+            # v9.22: 启动器切换"客机自动确认旅行"
+            from multimod import lobby
+            lobby.toggle_travel_auto_ack()
         # 执行后删除，避免残留
         try:
             os.remove(CMD_PATH)
@@ -584,6 +711,14 @@ def _check_lot_status():
         if in_lot != _last_lot_status:
             _last_lot_status = in_lot
             _log("lot status changed: in_lot={}".format(in_lot))
+            # v9.22: 旅行进行中自动上报抵达（原实现只能手动 mp_travel_arrived，
+            # 没人记得输 → 到达确认流程形同虚设）。非旅行时的进图仍走原逻辑。
+            if in_lot:
+                try:
+                    from multimod import lobby
+                    lobby.auto_report_arrival()
+                except Exception as e:
+                    _log("auto arrival report error: {}".format(e))
             try:
                 from multimod import lobby
                 lobby.report_my_in_lot(in_lot)
@@ -608,9 +743,13 @@ def _has_active_sim():
         return False
 
 
+_alarm_error_logged = False  # v9.22: alarm 注册失败只记一次日志（主菜单阶段
+                             # 每 5s 重试会刷屏，掩盖真正的连接日志）
+
+
 def _ensure_alarm():
     """确保处理 alarm 已启动"""
-    global _process_alarm_handle
+    global _process_alarm_handle, _alarm_error_logged
     try:
         if _process_alarm_handle is not None:
             return
@@ -626,9 +765,12 @@ def _ensure_alarm():
             repeating=True,
             cross_zone=True,
         )
+        _alarm_error_logged = False
         _log("alarm started")
     except Exception as e:
-        _log("alarm error: {}".format(e))
+        if not _alarm_error_logged:
+            _alarm_error_logged = True
+            _log("alarm error (will retry until in-lot): {}".format(e))
 
 
 # alarm 延迟到命令执行时注册（游戏加载早期 TimeService 未初始化，会报 NoneType 错误）
@@ -894,7 +1036,13 @@ def _recv_loop(sock, is_client=False, player_id=None):
                 frame_data = buf[44:44 + frame_len]
                 buf = buf[44 + frame_len:]
                 # v9.16: HMAC 验签（研究: RFC 2104）——先验签再反序列化（防伪造/篡改）
-                if not _verify_frame(frame_data, frame_sig, _hmac_keys.get(player_id)):
+                # v9.22 修复: 客机端原来恒用 _hmac_keys.get(None)=None 查 key——
+                # 客机对主机帧的验签从未真正生效。改按本机 pid 查（welcome 后即有 key）。
+                if is_client:
+                    _key = _hmac_keys.get(_my_player_id)
+                else:
+                    _key = _hmac_keys.get(player_id)
+                if not _verify_frame(frame_data, frame_sig, _key):
                     _log("frame HMAC mismatch ({}B), dropped".format(frame_len))
                     continue
                 # v9.15: CRC32 校验（研究: Ethernet FCS）——坏帧丢弃不崩
@@ -905,6 +1053,16 @@ def _recv_loop(sock, is_client=False, player_id=None):
                     # 只反序列化信任的联机对端数据（局域网/房主-客机场景，
                     # 双方都运行同一个 mod；pickle 用于性能，JSON 已实测慢 2.8x）
                     msg = pickle.loads(frame_data)
+                    # v9.22 P1: 未认证连接（会话密钥未派生）帧上限——握手前只接受
+                    # ≤4KB 的帧，超大帧直接丢弃。说明：消息类型只能 pickle 反序列化
+                    # 之后才能看到，类型白名单挡不住反序列化本身；真正有效的是
+                    # 大小上限（限制注入载荷规模）。语义级防护由 HOST_ONLY 白名单
+                    # 在 _process_incoming 兜底。完整修复需协议 v3 把消息类型提
+                    # 到帧头明文区。
+                    if _key is None:
+                        if frame_len > _PRE_AUTH_MAX_FRAME:
+                            _log("pre-auth oversized frame dropped ({}B)".format(frame_len))
+                            continue
                     # v9.21 P0-4: 入站队列上限——对端异常高频发送/洪泛时，
                     # 无界队列会吃满内存（主线程 alarm 每 500ms 才消费一次）。
                     # 超限丢弃最新消息并记日志（保留已排队的旧消息，避免状态断裂）。
@@ -952,6 +1110,9 @@ def _recv_loop(sock, is_client=False, player_id=None):
                 # 新客机在完成握手派生新 key 之前，收端会用【旧 key】验签它的帧 →
                 # HMAC mismatch 静默丢帧（重连后消息神秘消失）。
                 _hmac_keys.pop(player_id, None)
+                # v9.22: 连接级 nonce + 反向索引同步清理（防泄漏/错查）
+                _conn_nonces.pop(player_id, None)
+                _sock_pid_index.pop(id(sock), None)
                 disconnected = True
         if disconnected:
             try:
@@ -973,15 +1134,16 @@ def _handle_client(conn, addr):
                 player_id = _next_player_id
                 _next_player_id += 1
             _clients[player_id] = (conn, addr)
+            _sock_pid_index[id(conn)] = player_id  # v9.22: 反向索引
         _log("client connected: {} pid={}".format(addr, player_id))
         # 欢迎消息（含 player_id + 协议版本）
-        # v9.16: host 生成 host_nonce（握手密钥交换——密钥在收到 hello 后派生）
-        global _my_nonce, _peer_nonce
-        _my_nonce = _gen_nonce()
-        _peer_nonce = b""
+        # v9.22: host_nonce 按连接独立生成（原全局 _my_nonce 并发覆盖 bug）
+        host_nonce = _gen_nonce()
+        with _clients_lock:
+            _conn_nonces[player_id] = host_nonce
         _send_json(conn, {"type": "welcome", "player_id": player_id,
                           "proto_version": PROTO_VERSION,
-                          "host_nonce": _my_nonce.decode("utf-8")}, prio=0)
+                          "host_nonce": host_nonce.decode("utf-8")}, prio=0)
         # 通知 lobby 有新成员
         try:
             from multimod import lobby
@@ -1074,6 +1236,10 @@ def _server_thread(port=DEFAULT_PORT):
                             # （不清理会让复用该 pid 的新客机被旧 key 验签 → 静默丢帧）
                             _release_pid(old_pid)
                             _hmac_keys.pop(old_pid, None)
+                            # v9.22: 旧连接的 nonce 与反向索引一并清理
+                            _conn_nonces.pop(old_pid, None)
+                            if old_sock is not None:
+                                _sock_pid_index.pop(id(old_sock), None)
                         # 继续接受新连接（不 continue）
                 except Exception as e:
                     _log("dup check error: {}".format(e))
@@ -1197,13 +1363,14 @@ def _client_thread(host, port=DEFAULT_PORT):
 
 @sims4.commands.Command('mp_host', command_type=sims4.commands.CommandType.Live)
 def mp_host(port=None, visibility="public", _connection=None):
-    global _network_thread, _is_host
+    global _network_thread, _is_host, _host_port
     _log("mp_host called: port={} visibility={}".format(port, visibility))
     output = sims4.commands.CheatOutput(_connection)
     try:
         port = int(port) if port else DEFAULT_PORT
     except Exception:
         port = DEFAULT_PORT
+    _host_port = port  # v9.23: 看门狗重启监听用
     # ⚠️ alarm 必须在检查"已在运行"之前注册——auto-apply 可能已启动 host 但
     # 主菜单阶段 alarm 失败；此时游戏已进地段，重试必然成功
     _ensure_alarm()
@@ -1414,12 +1581,14 @@ def _apply_launcher_config():
 
     返回: (bool ok, str desc)
     """
-    global _network_thread  # ⚠️ 必须声明！否则赋值被当局部变量 → referenced before assignment
+    global _network_thread, _host_port  # ⚠️ 必须声明！否则赋值被当局部变量 → referenced before assignment
     cfg = _load_launcher_config()
     if not cfg:
         return False, "无启动器配置 (mp_launcher_config.json)"
     mode = cfg.get("mode")
     port = int(cfg.get("port", DEFAULT_PORT))
+    if mode == "host":
+        _host_port = port  # v9.23: 看门狗重启监听用
     if mode == "host":
         if _network_thread and _network_thread.is_alive():
             return False, "MP 已经在运行"
@@ -1481,18 +1650,20 @@ def _apply_launcher_config():
     else:
         return False, "未知模式: {}".format(mode)
 
-    # 自动开始位置同步（连接建立后再触发，最多等 60s）
+    # 自动开始位置同步（连接建立后再触发，最多等 150s）
     # ⚠️ v5.4.3 修复：不能固定 sleep(3) —— 主菜单 auto-apply 时连接未建立，
     # mp_sync 提前调用会失败（"未连接"），之后连接成功但广播永不启动。
     # 正确做法：循环等 _client_socket 非空 + _network_thread 存活，再调 mp_sync
+    # v9.22: 60s→150s——重连退避最长可达 60s，60s 等待会在深度退避时
+    # 提前放弃（日志 "auto sync skipped: 60s 内未建立连接" 即此情况）
     if cfg.get("auto_sync", True):
         def _delayed_sync():
-            for _ in range(60):
+            for _ in range(150):
                 if _client_socket is not None and _network_thread is not None and _network_thread.is_alive():
                     break
                 time.sleep(1.0)
             else:
-                _log("auto sync skipped: 60s 内未建立连接")
+                _log("auto sync skipped: 150s 内未建立连接")
                 return
             try:
                 from multimod import sync

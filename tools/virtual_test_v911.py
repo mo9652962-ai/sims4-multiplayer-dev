@@ -208,7 +208,7 @@ lobby._members = {0: {'name': 'host', 'player_id': 0, 'is_host': True, 'in_lot':
 lobby._travel_active = True
 lobby._travel_arrived = {0}  # 只有房主到了
 Net.sent = []
-lobby._travel_check_missing()
+lobby._travel_progress_check(True)
 sent_miss = [p for p in Net.sent if p.get("type") == "travel_missing"]
 check('超时未到齐→travel_missing 广播', len(sent_miss) == 1 and "b" in sent_miss[0].get("missing", []))
 check('超时→解锁', lobby._travel_active is False)
@@ -217,7 +217,7 @@ check('超时→解锁', lobby._travel_active is False)
 lobby._travel_active = True
 lobby._travel_arrived = {0, 1}
 Net.sent = []
-lobby._travel_check_missing()
+lobby._travel_progress_check(True)
 check('已到齐→不广播 missing', not any(p.get("type") == "travel_missing" for p in Net.sent))
 lobby._travel_active = False
 

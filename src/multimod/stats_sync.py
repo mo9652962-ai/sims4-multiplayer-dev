@@ -33,7 +33,7 @@ _running = False
 def _get_my_sim_info():
     """获取本机控制的 sim_info"""
     try:
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         mgr = services.sim_info_manager()
         if mgr is None:
             return None
@@ -123,7 +123,7 @@ def process_message(data):
         stats = data.get("stats")
         if not stats:
             return
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         mgr = services.sim_info_manager()
         if mgr is None:
             return

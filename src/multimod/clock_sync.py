@@ -84,13 +84,29 @@ def set_host_flag(is_host):
     network._log("clock role: {}".format("host" if is_host else "client"))
 
 
+def _get_game_clock():
+    """v9.21.1: 取 GameClock 服务。真实游戏 API 是 services.game_clock_service()
+    （反编译 ui_dialog_service.pyc 同款调用；services/__init__.pyc 中只有此名）。
+    get_game_clock_service 是虚拟测试 stub 的旧名，保留 fallback 兼容既有测试。
+    """
+    try:
+        import services
+        fn = getattr(services, "game_clock_service", None)
+        if fn is None:
+            fn = getattr(services, "get_game_clock_service", None)
+        if fn is None:
+            return None
+        return fn()
+    except Exception:
+        return None
+
+
 def apply_remote_clock(speed):
     """客机应用主机广播的速度（在 alarm 主线程调用）"""
     global _applying_remote
     try:
         from clock import ClockSpeedMode
-        import services
-        gcs = services.get_game_clock_service()
+        gcs = _get_game_clock()
         if gcs is None:
             network._log("clock apply FAIL: game_clock_service is None")
             return
@@ -144,12 +160,8 @@ def mp_clock(action="status", _connection=None):
         return
 
     # status
-    try:
-        import services
-        gcs = services.get_game_clock_service()
-        speed = int(gcs.clock_speed) if gcs else -1
-    except Exception:
-        speed = -1
+    gcs = _get_game_clock()
+    speed = int(gcs.clock_speed) if gcs else -1
     output("时间同步: {} | 角色: {} | 当前速度: {}".format(
         "开" if _clock_sync_enabled else "关",
         "主机" if _is_host else "客机",
@@ -160,9 +172,14 @@ def mp_clock(action="status", _connection=None):
 
 # ============ v9.17: 登录快照支持 ============
 def get_current_speed():
-    """返回当前游戏速度（快照用）"""
+    """返回当前游戏速度（快照用）。v9.21.1: 原实现 from sims4 import services
+    ——真实游戏无 sims4.services 模块（python/core/sims4/ 下不存在 services），
+    恒走 except 返回 None，导致 world_snapshot 从不带 clock_speed。改走 _get_game_clock()。
+    """
     try:
-        from sims4 import services
-        return services.get_game_clock_service().clock_speed
+        gcs = _get_game_clock()
+        if gcs is None:
+            return None
+        return gcs.clock_speed
     except Exception:
         return None

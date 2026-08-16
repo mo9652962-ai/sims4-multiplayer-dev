@@ -27,6 +27,40 @@ sys.modules['sims4.resources'] = type('resources', (), {})
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+# v9.22: launcher 依赖 customtkinter/PIL（GUI 库，嵌入式测试环境不装）——
+# 注入 stub 后只测纯逻辑函数，不实例化 GUI。之前直接 ModuleNotFoundError 整套挂掉。
+class _CTkStub:
+    def __init__(self, *a, **kw): pass
+    def configure(self, *a, **kw): pass
+    def grid(self, *a, **kw): pass
+    def pack(self, *a, **kw): pass
+    def bind(self, *a, **kw): pass
+    def after(self, *a, **kw): pass
+    def get(self): return ""
+    def insert(self, *a, **kw): pass
+    def delete(self, *a, **kw): pass
+class _ctk_mod:
+    CTk = _CTkStub
+    CTkFrame = CTkButton = CTkLabel = CTkEntry = CTkTextbox = _CTkStub
+    CTkProgressBar = CTkImage = CTkToplevel = CTkScrollableFrame = CTkSwitch = _CTkStub
+    CTkFont = lambda *a, **kw: None
+    CTkInputDialog = _CTkStub
+    set_appearance_mode = staticmethod(lambda *a: None)
+    set_default_color_theme = staticmethod(lambda *a: None)
+    set_widget_scaling = staticmethod(lambda *a: None)
+class _PILStub:
+    class Image:
+        @staticmethod
+        def open(*a, **kw): return None
+        @staticmethod
+        def new(*a, **kw): return None
+    class ImageTk:
+        @staticmethod
+        def PhotoImage(*a, **kw): return None
+sys.modules['customtkinter'] = _ctk_mod
+sys.modules['PIL'] = _PILStub
+
 from multimod import network
 
 pc = fc = 0

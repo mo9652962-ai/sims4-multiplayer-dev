@@ -53,7 +53,7 @@ def _out(msg, _connection=None):
 def _family_sim_ids():
     """家庭内所有 sim_info id 列表"""
     try:
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         hh = services.active_household()
         if hh is None:
             return []
@@ -88,7 +88,7 @@ def _broadcast_loop():
             for i in range(len(ids)):
                 for j in range(i + 1, len(ids)):
                     a, b = ids[i], ids[j]
-                    from sims4 import services
+                    import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
                     sia = services.sim_info_manager().get(a)
                     sib = services.sim_info_manager().get(b)
                     if sia is None or sib is None:
@@ -142,7 +142,7 @@ def process_message(data):
         bits = data.get("bits", [])
         if not sim_a or not sim_b:
             return
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         sia = services.sim_info_manager().get(sim_a)
         sib = services.sim_info_manager().get(sim_b)
         if sia is None or sib is None:

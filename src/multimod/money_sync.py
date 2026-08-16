@@ -24,7 +24,7 @@ _running = False
 def _get_funds():
     """获取当前家庭资金（sim_info.household.funds 或 house_hold 资金）"""
     try:
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         sim_info_manager = services.sim_info_manager()
         if sim_info_manager is None:
             return None
@@ -72,7 +72,7 @@ def process_message(data):
         funds = data.get("funds")
         if funds is None:
             return
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         sim_info_manager = services.sim_info_manager()
         if sim_info_manager is None:
             return
@@ -138,7 +138,7 @@ def mp_money(funds=None, _connection=None):
 def collect_snapshot():
     """返回当前家庭资金（快照用，None=获取失败）"""
     try:
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         hh = services.active_household()
         if hh is None:
             return None

@@ -24,8 +24,9 @@ import time
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
-APP_VERSION = "9.21.0"
-APP_REPO = "mo9652962-ai/second-brain"  # v8.5: GitHub 自动更新检查源
+APP_VERSION = "9.22.1"
+APP_REPO = "mo9652962-ai/sims4-multiplayer-dev"  # v9.22 修复: 自动更新源指向本项目仓库
+                                             # （原指向 second-brain，更新检查永远 404）
 UPDATE_URL = "https://api.github.com/repos/{}/releases/latest".format(APP_REPO)
 DEFAULT_GAME_DIR = r"D:\Games\The Sims 4"
 GAME_EXE = r"Game\Bin\TS4_x64.exe"
@@ -65,6 +66,12 @@ C = {
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("green")
+
+
+def _ui_font(size=13, weight="normal"):
+    """v9.22.1: 统一中文 UI 字体（微软雅黑）——CTk 默认字体渲染中文发虚；
+    系统无此字体时 tkinter 自动回退默认族，不会报错"""
+    return ctk.CTkFont(family="Microsoft YaHei UI", size=size, weight=weight)
 
 # v8.8: 主题配色表（研究: CustomTkinter 自定义主题 JSON 思路）
 THEMES = {
@@ -130,8 +137,26 @@ class LauncherApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Sims4Multiplayer 联机启动器 v{}".format(APP_VERSION))
-        self.geometry("900x620")
         self.minsize(820, 560)
+        # v9.22.1: 恢复上次窗口几何；首次启动屏幕居中（原实现固定 900x620 贴左上角）
+        _geo = None
+        try:
+            _sp = self._settings_path()
+            if os.path.exists(_sp):
+                with open(_sp, "r", encoding="utf-8") as _f:
+                    _geo = json.load(_f).get("win_geometry")
+        except Exception:
+            _geo = None
+        if isinstance(_geo, str) and _geo.count("x") >= 1 and "+" in _geo:
+            self.geometry(_geo)
+        else:
+            self.geometry("900x620")
+            self.update_idletasks()
+            _sw, _sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            self.geometry("+{}+{}".format(max(0, (_sw - 900) // 2),
+                                          max(0, (_sh - 620) // 2 - 20)))
+        # v9.22.1: 关闭时记忆窗口几何
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # 图标
         icon_path = os.path.join(ASSET_DIR, "launcher_icon.ico")
@@ -171,7 +196,7 @@ class LauncherApp(ctk.CTk):
         # Logo 区
         logo = ctk.CTkLabel(nav, text="🎮", font=ctk.CTkFont(size=34))
         logo.pack(pady=(24, 0))
-        logo_t = ctk.CTkLabel(nav, text="Sims4\nMultiplayer", font=ctk.CTkFont(size=17, weight="bold"),
+        logo_t = ctk.CTkLabel(nav, text="Sims4\nMultiplayer", font=_ui_font(17, "bold"),
                               text_color=C["neon"], justify="center")
         logo_t.pack(pady=(4, 20))
 
@@ -179,7 +204,7 @@ class LauncherApp(ctk.CTk):
         self._nav_buttons = []
         items = [("🔌 连接", 0), ("👥 房间", 1), ("💬 聊天", 2), ("⚙️ 设置", 3), ("ℹ️ 关于", 4)]
         for text, idx in items:
-            btn = ctk.CTkButton(nav, text=text, font=ctk.CTkFont(size=14),
+            btn = ctk.CTkButton(nav, text=text, font=_ui_font(14),
                                 anchor="w", height=40, corner_radius=10,
                                 fg_color="transparent", hover_color="#2A2A2A",
                                 text_color=C["dim"], command=lambda i=idx: self._switch_tab(i))
@@ -200,12 +225,12 @@ class LauncherApp(ctk.CTk):
         # 顶部标题栏
         header = ctk.CTkFrame(main, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        self.page_title = ctk.CTkLabel(header, text="🔌 连接", font=ctk.CTkFont(size=24, weight="bold"),
+        self.page_title = ctk.CTkLabel(header, text="🔌 连接", font=_ui_font(24, "bold"),
                                        text_color=C["text"])
         self.page_title.pack(side="left")
         self.status_badge = ctk.CTkLabel(header, text="● 未连接", corner_radius=12,
                                          fg_color="#1E1E1E", text_color=C["dim"],
-                                         font=ctk.CTkFont(size=12, weight="bold"))
+                                         font=_ui_font(12, "bold"))
         self.status_badge.pack(side="right")
 
         # 页面容器（玻璃卡片叠加）
@@ -353,6 +378,13 @@ class LauncherApp(ctk.CTk):
                                         height=44, corner_radius=12, fg_color="#242424", hover_color="#2E2E2E",
                                         text_color=C["dim"], command=self._write_config_only)
         self.config_btn.grid(row=0, column=2, sticky="ew", padx=(0, 0))
+        # v9.24: 直接启动游戏（恢复老版一键启动——不走房间准备/存档同步流程，
+        # 适合单机测试或熟人快速开局；按钮丢失反馈恢复）
+        self.direct_btn = ctk.CTkButton(btn_row, text="🎮 直接启动游戏（跳过房间流程）",
+                                        font=_ui_font(13),
+                                        height=36, corner_radius=12, fg_color="#1E3A5F",
+                                        hover_color="#16324F", command=self._direct_launch)
+        self.direct_btn.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
 
         # 连接信息 + 日志（Bento 右列：占满整列高度）
         bottom = ctk.CTkFrame(pg, fg_color="transparent")
@@ -485,6 +517,15 @@ class LauncherApp(ctk.CTk):
                                        height=40, corner_radius=10, fg_color="#242424",
                                        hover_color="#2E2E2E", command=self._leave_room)
         self.leave_btn.grid(row=1, column=1, sticky="ew", padx=3, pady=2)
+        # v9.22: 共同旅行（S4MP 没有的功能）——房主一键发起，客机自动确认+自动到达上报
+        self.travel_btn = ctk.CTkButton(btn_row, text="🧳 共同旅行(房主)", font=ctk.CTkFont(size=13),
+                                        height=40, corner_radius=10, fg_color="#242424",
+                                        hover_color="#2E2E2E", command=self._travel_together)
+        self.travel_btn.grid(row=2, column=0, sticky="ew", padx=3, pady=2)
+        self.travel_auto_btn = ctk.CTkButton(btn_row, text="⚡ 旅行自动确认: 开", font=ctk.CTkFont(size=13),
+                                             height=40, corner_radius=10, fg_color="#242424",
+                                             hover_color="#2E2E2E", command=self._toggle_travel_auto)
+        self.travel_auto_btn.grid(row=2, column=1, sticky="ew", padx=3, pady=2)
 
         # 提示（全宽，row3）
         ctk.CTkLabel(pg, text="提示: 房主点「同步存档」需全员准备 → 同步完成 → 全员进图后房主可「开始游戏」。游戏内命令: mp_ready/mp_unready/mp_syncsave/mp_start/mp_leave/mp_kick",
@@ -619,6 +660,40 @@ class LauncherApp(ctk.CTk):
             for ip, info in list(discovered.items())[:5]:
                 lines.append("   {} · {} · {}人 · 码{}".format(
                     ip, info.get("name", "?"), info.get("players", 0), info.get("room_code", "")))
+
+        # v9.23: 连接健康显示（mod 写入 health 字段——RTT + 质量评级）
+        health = state.get("health") or {}
+        try:
+            rtt = health.get("rtt_ms")
+            label = health.get("label", "未测量")
+            if rtt is not None:
+                lines.append("")
+                lines.append("📶 连接质量: {} (延迟 {}ms)".format(label, rtt))
+        except Exception:
+            pass
+
+        # v9.22: 旅行状态板（mod 写入 travel 字段——谁已抵达/待抵达）
+        travel = state.get("travel") or {}
+        try:
+            auto_on = bool(travel.get("auto_ack", True))
+            self.travel_auto_btn.configure(
+                text="⚡ 旅行自动确认: {}".format("开" if auto_on else "关"),
+                fg_color="#242424" if auto_on else "#1A1A1A")
+            if travel.get("active"):
+                arrived = travel.get("arrived", [])
+                pending = travel.get("pending", [])
+                self.travel_btn.configure(text="🧳 旅行进行中...", fg_color="#1A1A1A")
+                lines.append("")
+                lines.append("🧳 共同旅行进行中 — 已抵达: {}".format(
+                    ", ".join(arrived) if arrived else "无"))
+                lines.append("   ⏳ 待抵达: {}".format(", ".join(pending) if pending else "无"))
+            else:
+                self.travel_btn.configure(
+                    text="🧳 共同旅行(房主)" if is_host else "🧳 共同旅行(需房主)",
+                    state="normal" if is_host else "disabled",
+                    fg_color="#242424" if is_host else "#1A1A1A")
+        except Exception:
+            pass
         self._set_room_text("\n".join(lines))
 
     # ============ v9.18: 启动器房间模式刷新 ============
@@ -811,6 +886,23 @@ class LauncherApp(ctk.CTk):
                 json.dump({"cmd": cmd, "ts": time.time()}, f)
         except Exception as e:
             self._log("写命令失败: {}".format(e))
+
+    # v9.22: 共同旅行（S4MP 无此功能——一键发起 + 自动确认 + 到达状态板）
+    def _travel_together(self):
+        """房主发起共同旅行（全员确认后同时加载，自动到达上报）"""
+        self._write_mp_cmd("mp_travel")
+        self._log("已发起共同旅行 (游戏内 mp_travel)：客机将自动确认")
+        try:
+            self.travel_btn.configure(text="🧳 发起成功,等待全员...", fg_color="#1A1A1A")
+        except Exception:
+            pass
+        self.after(1500, self._refresh_room)
+
+    def _toggle_travel_auto(self):
+        """切换客机自动确认旅行（对局体验：免去每人手输 mp_travel_ack）"""
+        self._write_mp_cmd("mp_travel_auto")
+        self._log("已切换旅行自动确认 (游戏内 mp_travel_auto)")
+        self.after(1200, self._refresh_room)
 
     # ---- 聊天页 ----
     def _build_chat_page(self, pg):
@@ -1072,6 +1164,14 @@ class LauncherApp(ctk.CTk):
     def _settings_path(self):
         return os.path.join(os.path.expanduser("~"), "AppData", "Local", "Sims4Multiplayer", "settings.json")
 
+    def _on_close(self):
+        """v9.22.1: 关闭前记忆窗口几何（下次启动恢复位置和大小）"""
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+        self.destroy()
+
     def _load_settings(self):
         """启动时恢复上次设置（模式/IP/端口/游戏目录/自动同步）"""
         try:
@@ -1120,6 +1220,11 @@ class LauncherApp(ctk.CTk):
         """保存当前设置（下次启动恢复）"""
         try:
             s = {}
+            # v9.22.1: 记忆窗口几何（位置+大小）
+            try:
+                s["win_geometry"] = self.geometry()
+            except Exception:
+                pass
             if hasattr(self, "mode_var"):
                 s["mode"] = self.mode_var.get()
             if hasattr(self, "host_ip_var"):
@@ -1208,6 +1313,15 @@ class LauncherApp(ctk.CTk):
             self._create_room()
         else:
             self._join_room()
+
+    def _direct_launch(self):
+        """v9.24: 直接启动游戏——按当前界面模式写配置并启动（老版一键流程）"""
+        if getattr(self, "room_server", None) or getattr(self, "room_client", None):
+            self._log("已处于房间会话——请用房间页的「开始游戏」按钮")
+            return
+        self._log("🎮 直接启动（模式: {}）——跳过房间准备/存档同步流程".format(
+            "房主" if self.mode_var.get() == "host" else "加入"))
+        self._start_game_after_room()
 
     def _create_room(self):
         """房主创建房间（启动器开 TCP 房间服务，不启动游戏）"""

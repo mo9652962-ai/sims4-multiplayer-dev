@@ -134,6 +134,16 @@ def _collect_local_addrs():
         return ""
 
 
+def _connection_health():
+    """v9.23: 当前连接健康摘要（RTT + 质量评级，None=未测量）"""
+    try:
+        rtt = network.get_rtt_ms()
+        return {"rtt_ms": (round(rtt, 1) if rtt is not None else None),
+                "label": network.get_health_label()}
+    except Exception:
+        return {"rtt_ms": None, "label": "未测量"}
+
+
 def _write_state_file():
     """写房间状态到文件（启动器 GUI 轮询读取）
 
@@ -154,6 +164,18 @@ def _write_state_file():
             # v9.20: 本机多地址（IPv4+IPv6 分号分隔，借鉴 S4MP room_code 格式）
             "room_addr": _collect_local_addrs(),
             "chat": _chat_history,  # v9.0: 聊天历史（启动器聊天页读取）
+            # v9.23: 连接健康（RTT + 质量评级，启动器房间页显示）
+            "health": _connection_health(),
+            # v9.22: 旅行状态板（启动器房间页显示谁已抵达/待抵达）
+            "travel": _travel_board if _travel_board is not None else {
+                "active": _travel_active,
+                "auto_ack": _travel_auto_ack,
+                "follow": _follow_travel,
+                "arrived": [m.get("name", pid) for pid, m in _members.items()
+                            if m.get("player_id", pid) in _travel_arrived],
+                "pending": [m.get("name", pid) for pid, m in _members.items()
+                            if m.get("player_id", pid) not in _travel_arrived],
+            },
         }
         # v7.0: 加入者附加局域网发现的房间（启动器"发现房间"功能）
         if not network._is_host:
@@ -181,7 +203,14 @@ def _broadcast_state():
     try:
         payload = {"type": "lobby", "members": list(_members.values()),
                    "save_sync_phase": _save_sync_phase, "start_granted": _start_granted,
-                   "room_code": ROOM_CODE, "room_visibility": ROOM_VISIBILITY}
+                   "room_code": ROOM_CODE, "room_visibility": ROOM_VISIBILITY,
+                   # v9.22: 旅行状态板随房间状态广播（客机启动器同步显示）
+                   "travel": {"active": _travel_active, "auto_ack": _travel_auto_ack,
+                              "follow": _follow_travel,
+                              "arrived": [m.get("name", pid) for pid, m in _members.items()
+                                          if m.get("player_id", pid) in _travel_arrived],
+                              "pending": [m.get("name", pid) for pid, m in _members.items()
+                                          if m.get("player_id", pid) not in _travel_arrived]}}
         if network._is_host:
             network._broadcast(payload)
         else:
@@ -827,6 +856,131 @@ _travel_acks = set()
 _travel_active = False      # 旅行进行中（场景切换锁定）
 _travel_arrived = set()     # 已抵达新场景的成员（房主侧）
 _travel_go_ts = 0           # go 广播时间（超时检测用）
+_travel_auto_ack = True     # v9.22: 客机自动确认旅行（默认开——原实现要求每人
+                            # 手输 mp_travel_ack，实际对局没人输 → 全靠 10s 超时兜底）
+_travel_board = None        # v9.22: 客机侧镜像的旅行状态板（lobby 广播携带）
+_travel_saved_speed = 1     # v9.23: 旅行前主机时钟速度（到齐后恢复——加载期间
+                            # 客机无法处理 tick，锁时钟防时间漂移，S4MP 加载黑屏
+                            # 场景的经典对策）
+_follow_travel = True       # v9.24: 游戏内旅行自动跟随（主机 zone 变化 → 全员
+                            # 自动切同一 zone——反编译 sims.visit_target_sim 确认
+                            # sim_info.send_travel_switch_to_zone_op 为原生入口）
+
+
+def on_host_zone_changed(new_zone_id):
+    """v9.24: 主机游戏内旅行被检测到（current_zone_id 变化）→ 全员自动跟随。
+
+    完整链路：主机在游戏里正常旅行（手机选地点/点地图/拜访）→ 本函数广播
+    travel_follow + 锁时钟 → 客机 on_travel_follow 调原生 API 自动切 zone →
+    各端进图后 auto_report_arrival（v9.22）→ 全员到齐自动恢复时钟+刷新快照
+    （v9.23）。玩家全程不需要输任何命令。
+    """
+    global _travel_active, _travel_arrived, _travel_go_ts, _travel_saved_speed
+    if not _follow_travel:
+        network._log("lobby: follow travel off, host zone change ignored")
+        return
+    if _travel_active:
+        network._log("lobby: travel already active, skip zone change")
+        return
+    _travel_active = True
+    _travel_arrived = {0}  # 房主已在路上
+    _travel_go_ts = time.time()
+    # 时钟锁定（同 _travel_force_start）
+    try:
+        from multimod import clock_sync
+        sp = clock_sync.get_current_speed()
+        _travel_saved_speed = int(sp) if sp is not None else 1
+    except Exception:
+        _travel_saved_speed = 1
+    try:
+        _cb = getattr(network, "_send_clock_broadcast", None)
+        if _cb is not None:
+            _cb(0)
+    except Exception as e:
+        network._log("lobby: travel clock lock error: {}".format(e))
+    network._broadcast({"type": "travel_follow", "zone_id": int(new_zone_id),
+                        "ts": time.time()})
+    _notify("🧳 检测到你的旅行，成员正在自动跟随...")
+    network._log("lobby: travel_follow broadcast zone={}".format(new_zone_id))
+    # 分级超时（同 travel_go 路径）
+    try:
+        import threading
+        threading.Timer(30.0, lambda: _travel_progress_check(False)).start()
+        threading.Timer(60.0, lambda: _travel_progress_check(False)).start()
+        threading.Timer(90.0, lambda: _travel_progress_check(True)).start()
+    except Exception:
+        pass
+    _write_state_file()
+
+
+def on_travel_follow(data):
+    """v9.24: 客机收到主机旅行跟随 → 自动切换到同一 zone（原生 API）"""
+    global _travel_active
+    _travel_active = True
+    zone_id = data.get("zone_id")
+    network._notify("🧳 房主已出发旅行，正在自动跟随前往同一地点...")
+    network._log("lobby: travel_follow received zone={}".format(zone_id))
+    ok = _auto_travel_to_zone(zone_id)
+    if not ok:
+        network._notify("⚠️ 请手动旅行到房主的新地点（跟随失败已记录日志）")
+    _write_state_file()
+
+
+def _auto_travel_to_zone(zone_id):
+    """v9.24: 客机自动跟随旅行——游戏原生 zone 切换。
+
+    API 来源：反编译 server_commands/sim_commands.pyc 的 sims.visit_target_sim
+    ——游戏"传送到目标小人所在地"就是一句 sim.sim_info.send_travel_switch_to_
+    zone_op(zone_id=...)。同一存档同一世界模型下，客机切到同 zone 后由游戏
+    自己完成加载与小人迁移。
+    """
+    try:
+        import services
+        client = services.client_manager().get_first_client()
+        if client is None or client.active_sim is None:
+            network._log("auto travel: no active sim")
+            return False
+        client.active_sim.sim_info.send_travel_switch_to_zone_op(zone_id=int(zone_id))
+        network._log("lobby: auto travel switch to zone {}".format(zone_id))
+        return True
+    except Exception as e:
+        network._log("auto travel error: {}".format(e))
+        return False
+
+
+def _travel_restore_clock():
+    """v9.23: 旅行结束后恢复主机时钟速度（广播 saved speed，全员同步恢复）"""
+    try:
+        _cb = getattr(network, "_send_clock_broadcast", None)
+        if _cb is not None:
+            _cb(_travel_saved_speed)
+            network._log("lobby: travel clock restored -> {}".format(_travel_saved_speed))
+    except Exception as e:
+        try:
+            network._log("lobby: travel clock restore error: {}".format(e))
+        except Exception:
+            pass
+
+
+def auto_report_arrival():
+    """v9.22: 进图时自动上报抵达（network._check_lot_status 调用）。
+
+    仅旅行锁定中生效——普通进图不上报（否则每次进图都广播 travel_arrived 刷屏）。
+    原实现只有手动 mp_travel_arrived 命令，对局中没人记得输 → 到达确认形同虚设。
+    """
+    if not _travel_active:
+        return False
+    report_travel_arrived()
+    return True
+
+
+def toggle_travel_auto_ack():
+    """v9.22: 切换客机自动确认旅行（启动器按钮 / mp_travel_auto 命令）"""
+    global _travel_auto_ack
+    _travel_auto_ack = not _travel_auto_ack
+    _notify("旅行自动确认: {}".format("开" if _travel_auto_ack else "关"))
+    _write_state_file()
+    return _travel_auto_ack
 
 
 def host_start_travel():
@@ -860,22 +1014,41 @@ def on_travel_ack(player_id):
 
 def _travel_force_start():
     """全部确认（或超时）→ 通知所有成员开始加载"""
-    global _travel_pending, _travel_active, _travel_arrived, _travel_go_ts
+    global _travel_pending, _travel_active, _travel_arrived, _travel_go_ts, _travel_saved_speed
     if not _travel_pending:
         return
     _travel_pending = False
     _travel_active = True  # 场景切换锁定开始
     _travel_arrived = {0} if network._is_host else set()  # 房主自己视为"出发中"
     _travel_go_ts = time.time()
+    # v9.23: 旅行期间锁定时钟（广播 PAUSED）——场景加载时客机无法处理游戏
+    # tick，若主机时间继续走会造成加载后时间不一致；到齐/超时后恢复原速。
+    try:
+        from multimod import clock_sync
+        sp = clock_sync.get_current_speed()
+        _travel_saved_speed = int(sp) if sp is not None else 1
+    except Exception:
+        _travel_saved_speed = 1
+    # v9.23: 广播 PAUSED 锁定时钟（getattr 防御——测试 stub/旧环境无此函数时不炸）
+    try:
+        _cb = getattr(network, "_send_clock_broadcast", None)
+        if _cb is not None:
+            _cb(0)
+    except Exception as e:
+        network._log("lobby: travel clock lock error: {}".format(e))
     # 重置所有成员进图状态（离开旧场景）
     for m in _members.values():
         m["in_lot"] = False
     _notify("✅ 全员确认完毕，可以同时旅行了！")
     network._log("lobby: travel go")
     network._broadcast({"type": "travel_go", "ts": _travel_go_ts})
-    # 90s 后检查是否全部抵达（防黑屏/无限加载）
+    # v9.22: 分级超时（30/60/90s）——30/60s 只提示进度（在等谁），
+    # 90s 才解除锁定。原实现 90s 内零反馈，卡住的玩家不知道在等谁。
     import threading
-    threading.Timer(90.0, _travel_check_missing).start()
+    threading.Timer(30.0, lambda: _travel_progress_check(False)).start()
+    threading.Timer(60.0, lambda: _travel_progress_check(False)).start()
+    threading.Timer(90.0, lambda: _travel_progress_check(True)).start()
+    _write_state_file()
 
 
 def report_travel_arrived(zone_id=None):
@@ -926,10 +1099,21 @@ def _check_travel_all_arrived():
         _notify("✅ 全员已到达新场景，继续游戏！")
         network._log("lobby: travel all arrived")
         network._broadcast({"type": "travel_all_arrived", "ts": time.time()})
+        # v9.22: 旅行后全量快照刷新——新场景的位置/资金基准已变，只等各模块
+        # 下次变化才广播会长时间不一致（对端看不到彼此在新场景的初始位置）。
+        try:
+            with network._clients_lock:
+                socks = [s for (s, _a) in list(network._clients.values())]
+            for s in socks:
+                network._send_world_snapshot(s)
+        except Exception as e:
+            network._log("travel snapshot refresh error: {}".format(e))
+        _travel_restore_clock()  # v9.23: 到齐后恢复时钟（快照已对齐新场景）
+        _write_state_file()
 
 
-def _travel_check_missing():
-    """房主：go 后 90s 未到齐 → 广播 travel_missing（提示掉线成员）"""
+def _travel_progress_check(final):
+    """房主：go 后分级检查（v9.22: 30/60s 进度提示 / 90s 超时解除锁定）"""
     global _travel_active
     if not _travel_active:
         return
@@ -938,11 +1122,20 @@ def _travel_check_missing():
     missing = [m.get("name", "玩家{}".format(pid))
                for pid, m in list(_members.items())
                if m.get("player_id", pid) not in _travel_arrived]
-    if missing:
-        _travel_active = False
-        _notify("⚠️ 旅行超时：{} 未到达，已解除锁定".format(", ".join(missing)))
-        network._log("lobby: travel missing: {}".format(missing))
-        network._broadcast({"type": "travel_missing", "missing": missing})
+    if not missing:
+        return
+    if not final:
+        _notify("⏳ 旅行加载中：等待 {} ({}s)".format(
+            ", ".join(missing), int(time.time() - _travel_go_ts)))
+        network._log("lobby: travel progress missing: {}".format(missing))
+        _write_state_file()
+        return
+    _travel_active = False
+    _notify("⚠️ 旅行超时：{} 未到达，已解除锁定".format(", ".join(missing)))
+    network._log("lobby: travel missing: {}".format(missing))
+    network._broadcast({"type": "travel_missing", "missing": missing})
+    _travel_restore_clock()  # v9.23: 超时解锁也要恢复时钟
+    _write_state_file()
 
 
 def on_travel_all_arrived(data):
@@ -968,9 +1161,17 @@ def is_travel_active():
 
 
 def on_travel_req(data):
-    """客户端收到旅行请求 → 提示确认"""
-    _notify("房主要求同步旅行：请输入 mp_travel_ack 确认")
-    network._log("lobby: travel_req received")
+    """客户端收到旅行请求 → 自动确认（v9.22 默认）或提示手动确认"""
+    global _travel_auto_ack
+    if _travel_auto_ack:
+        if network._client_socket is not None:
+            network._send_json(network._client_socket,
+                               {"type": "travel_ack", "ts": time.time()}, prio=0)
+        _notify("🧳 房主发起共同旅行：已自动确认 ✅")
+        network._log("lobby: travel_req auto-acked")
+    else:
+        _notify("房主要求同步旅行：请输入 mp_travel_ack 确认")
+        network._log("lobby: travel_req received (manual ack mode)")
 
 
 def on_travel_go(data):
@@ -1169,11 +1370,12 @@ def process_message(data, sender_pid=None):
                 on_hello(sender_pid, name, ip)
                 # v9.16: 握手密钥派生（研究: HKDF RFC 5869）
                 # host 收到 client_nonce + 自己的 host_nonce → 派生会话密钥 → 回发 host_nonce
+                # v9.22: host_nonce 改按连接查询（_conn_nonces）——原用模块级全局
+                # network._my_nonce，两客机并发握手时被后连的覆盖 → 先连的派生错 key
                 try:
                     c_nonce = str(data.get("client_nonce", "")).encode()
-                    h_nonce = network._my_nonce
+                    h_nonce = network._conn_nonces.get(sender_pid)
                     if c_nonce and h_nonce:
-                        network._peer_nonce = c_nonce
                         network._hmac_keys[sender_pid] = network._derive_hmac_key(ROOM_PASSWORD, c_nonce, h_nonce)
                         network._log("HMAC key derived (host, {}B)".format(len(network._hmac_keys[sender_pid])))
                 except Exception as e:
@@ -1181,8 +1383,9 @@ def process_message(data, sender_pid=None):
                 # 回复 welcome（含自己的 player_id 和当前房间状态）
                 if network._client_socket is None and sender_pid in network._clients:
                     sock = network._clients[sender_pid][0]
+                    _h_nonce = network._conn_nonces.get(sender_pid) or b""
                     network._send_json(sock, {"type": "welcome", "player_id": sender_pid,
-                                              "host_nonce": network._my_nonce.decode("utf-8")})
+                                              "host_nonce": _h_nonce.decode("utf-8")})
                     network._send_json(sock, {"type": "lobby", "members": list(_members.values()),
                                               "save_sync_phase": _save_sync_phase,
                                               "start_granted": _start_granted,
@@ -1265,6 +1468,9 @@ def process_message(data, sender_pid=None):
                 _members[int(m["player_id"])] = m
             _save_sync_phase = data.get("save_sync_phase", "idle")
             _start_granted = data.get("start_granted", False)
+            # v9.22: 镜像主机侧旅行状态板（客机本地无 _travel_arrived 数据）
+            global _travel_board
+            _travel_board = data.get("travel")
             _write_state_file()
             network._log("lobby: received state, {} members".format(len(_members)))
             return
@@ -1523,6 +1729,27 @@ def mp_travel_arrived(zone_id="0", _connection=None):
     _safe_output(_connection, "已报告抵达新场景，等待全员...")
 
 
+@sims4.commands.Command('mp_travel_auto', command_type=sims4.commands.CommandType.Live)
+def mp_travel_auto(_connection=None):
+    """切换客机自动确认旅行（v9.22，默认开）: mp_travel_auto"""
+    state = toggle_travel_auto_ack()
+    _safe_output(_connection, "旅行自动确认: {}".format("开" if state else "关"))
+
+
+@sims4.commands.Command('mp_follow_travel', command_type=sims4.commands.CommandType.Live)
+def mp_follow_travel(_connection=None):
+    """切换游戏内旅行自动跟随（v9.24，默认开）: mp_follow_travel
+
+    开启时主机在游戏里旅行（手机选地点/点地图）会被自动检测，
+    成员自动跟随到同一地点，全程无需任何命令。
+    """
+    global _follow_travel
+    _follow_travel = not _follow_travel
+    _notify("游戏内旅行跟随: {}".format("开" if _follow_travel else "关"))
+    _write_state_file()
+    _safe_output(_connection, "游戏内旅行跟随: {}".format("开" if _follow_travel else "关"))
+
+
 def _safe_output(_connection, msg):
     try:
         if _connection is not None:
@@ -1537,12 +1764,24 @@ def reset_room_state():
     """完全重置房间状态（双端都调用）——解决第二次连接状态残留问题"""
     global _members, ROOM_CODE, ROOM_VISIBILITY, ROOM_PASSWORD
     global _save_sync_phase, _start_granted
+    global _travel_active, _travel_arrived, _travel_board, _travel_pending, _travel_acks
     _members = {}
     ROOM_CODE = ""
     ROOM_VISIBILITY = "public"
     ROOM_PASSWORD = ""
     _save_sync_phase = "idle"
     _start_granted = False
+    # v9.22: 旅行状态一并清理（否则二次联机残留"旅行中"锁死位置同步）
+    _travel_active = False
+    _travel_arrived = set()
+    _travel_board = None
+    _travel_pending = False
+    _travel_acks = set()
+    # v9.24: 主机 zone 基线重置（新会话首次进图重新建基线，不算旅行）
+    try:
+        network._last_zone_id = None
+    except Exception:
+        pass
     _write_state_file()
     network._log("lobby: room state reset")
 

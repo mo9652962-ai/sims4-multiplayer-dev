@@ -156,12 +156,15 @@ _ClockModule = type('clock', (), {'GameClock': _GameClock, 'ClockSpeedMode': _ma
 sys.modules['clock'] = _ClockModule
 
 # mock services.get_game_clock_service（apply_remote_clock 依赖）
+# v9.21.1: 同时 mock 真实游戏 API 名 game_clock_service（ui_dialog_service.pyc 同款），
+# 让 _get_game_clock 的主路径（非 fallback）被测试覆盖
 class _GameClockService:
     clock_speed = 1
     def set_clock_speed(self, mode):
         self.clock_speed = int(mode)
 _gcs = _GameClockService()
 def _get_game_clock_service(): return _gcs
+sys.modules['services'].game_clock_service = _get_game_clock_service
 sys.modules['services'].get_game_clock_service = _get_game_clock_service
 
 # 重置并安装 hook（幂等保护：先置 None）
@@ -208,6 +211,22 @@ try:
     check('process_message 分发', True)
 except Exception as e:
     check('process_message 分发', False, str(e))
+
+# B4b: 真实游戏形态回归——services 只有 game_clock_service（无旧名 fallback）。
+# v9.21.1 修复的 bug：原代码用 get_game_clock_service（真实游戏不存在），
+# 客机收主机 clock 广播后 apply 恒抛 AttributeError → 客机永不变速（暂停卡死）。
+try:
+    del sys.modules['services'].get_game_clock_service
+    _gcs.clock_speed = 0
+    clock_sync.apply_remote_clock(1)
+    check('真实API名 apply_remote_clock（客机解除暂停）', _gcs.clock_speed == 1,
+          "gcs.speed={}".format(_gcs.clock_speed))
+    _gcs.clock_speed = 0
+    clock_sync.get_current_speed()
+    check('真实API名 get_current_speed（快照）', _gcs.clock_speed == 0 and clock_sync.get_current_speed() == 0)
+finally:
+    sys.modules['services'].get_game_clock_service = _get_game_clock_service
+    _gcs.clock_speed = 1
 
 # B5: mp_clock status 命令
 try:

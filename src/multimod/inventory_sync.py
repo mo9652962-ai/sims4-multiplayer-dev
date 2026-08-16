@@ -52,7 +52,7 @@ def _out(msg, _connection=None):
 def _iter_sims():
     """遍历家庭内所有有背包的 sim 实例"""
     try:
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         hh = services.active_household()
         if hh is None:
             return []
@@ -135,7 +135,7 @@ def _apply_inventory(sim, remote_items):
             _broadcast(getattr(getattr(sim, "sim_info", None), "id", 0), local)
             return
         inv = sim.inventory_component
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         mgr = services.object_manager()
         # 删多余的
         for def_id, count in to_remove.items():
@@ -178,7 +178,7 @@ def process_message(data):
         items = data.get("items", {})
         if not isinstance(items, dict):
             return
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         sim_info = services.sim_info_manager().get(sim_id)
         if sim_info is None:
             return

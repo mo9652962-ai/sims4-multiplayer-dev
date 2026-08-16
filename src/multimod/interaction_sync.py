@@ -58,7 +58,7 @@ def _out(msg, _connection=None):
 def _get_my_sim():
     """获取本机控制的 active sim 实例（无则 None）"""
     try:
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         client = services.client_manager().get_first_client()
         if client is None:
             return None
@@ -70,7 +70,7 @@ def _get_my_sim():
 def _iter_sims():
     """遍历家庭内所有有 si_state 的 sim 实例"""
     try:
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         hh = services.active_household()
         if hh is None:
             return []
@@ -180,7 +180,7 @@ def process_message(data):
         if not guid:
             return
         # 找到目标 sim
-        from sims4 import services
+        import services  # v9.21.1: 真实游戏无 sims4.services，顶层 services 才是游戏模块
         sim_info = services.sim_info_manager().get(sim_id)
         if sim_info is None:
             return

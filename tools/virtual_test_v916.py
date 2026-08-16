@@ -124,6 +124,8 @@ class Net:
     notified = []
     PROTO_VERSION = network.PROTO_VERSION
     _my_nonce = b""
+    # v9.22: host_nonce 按连接存储（lobby hello 处理读 _conn_nonces[pid]）
+    _conn_nonces = {2: b"host_nonce_456"}
     @classmethod
     def _log(cls, msg): pass
     @classmethod

@@ -275,7 +275,7 @@ drain_queue()
 print()
 print('[E] 房主专属消息权限校验（防客机冒充）')
 network._is_host = True
-HOST_ONLY_SAMPLES = ["kicked", "start_game", "clock_sync", "save_sync_done"]
+HOST_ONLY_SAMPLES = ["kicked", "start_game", "clock", "save_sync_done"]
 for mt in HOST_ONLY_SAMPLES:
     drain_queue()
     _LOGS.clear()
@@ -298,7 +298,7 @@ network._incoming_queue.put(({"type": "start_game", "speed": 1}, 0))
 network._process_incoming()
 check('E6 客机收房主 start_game 放行', not logs_containing("dropped host-only"))
 check('E7 白名单覆盖关键指令',
-      {"kicked", "start_game", "clock_sync"}.issubset(network.HOST_ONLY_TYPES))
+      {"kicked", "start_game", "clock"}.issubset(network.HOST_ONLY_TYPES))
 
 
 # ============ F: accept 循环健壮性 ============
