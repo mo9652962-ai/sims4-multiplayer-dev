@@ -34,3 +34,7 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# 测试运行时产生的状态文件（v9.21）
+tools/mp_state_v9*.json
+tools/mp_lobby_state*.json

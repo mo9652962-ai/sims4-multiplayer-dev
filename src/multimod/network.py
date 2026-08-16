@@ -53,6 +53,32 @@ _client_connecting = False   # v9.20.4: 客机防双连接——mp_join/auto-app
 _next_player_id = 1          # 主机分配 player_id（0 = 房主自己）
 _released_pids = []          # v9.12: 释放的 player_id 复用池（防重连 ID 递增→KeyError）
 
+# v9.21 P0-1: 每 socket 发送锁——_send_json 用两次 sendall（帧头+数据）发一帧，
+# 多线程（_sync_loop/_money_loop/_mood_loop/主线程/心跳）并发发往同一 socket 时
+# 两次 sendall 可能交错 → 帧头 A + 数据 B 拼成撕裂帧 → 收端 CRC/HMAC 失败丢帧
+# （表现为随机丢消息/位置卡顿，极难定位）。按 socket 粒度加锁串行化整帧写入。
+_send_locks = {}                       # id(sock) → threading.Lock
+_send_locks_guard = threading.Lock()   # 保护 _send_locks 自身
+
+# v9.21 P1: pid 复用池上限——异常场景（大量短连接）下无界增长会占内存
+MAX_RELEASED_PIDS = 64
+
+# v9.21 P0-3: batch 防护——恶意/异常对端可发嵌套 batch 或超长 msgs 列表
+# 导致 _process_incoming 无限展开（队列爆炸 / 主线程卡死）
+MAX_BATCH_MSGS = 256
+
+# v9.21 P0-4: 入站队列上限——洪泛攻击/对端异常高频发送时队列无界增长 → 内存耗尽
+MAX_INCOMING_QUEUE = 4096
+
+# v9.21 P0-5: 房主专属消息白名单——这些消息只能由房主(pid=0)下发，
+# 客机发来即丢弃（防恶意客机冒充房主踢人/改时钟/强制开始游戏）
+HOST_ONLY_TYPES = frozenset([
+    "welcome", "kicked", "start_game", "clock_sync", "save_sync_req",
+    "save_chunk", "save_chunk_done", "save_sync_done", "travel_go",
+    "travel_all_arrived", "travel_missing", "host_migrated",
+    "version_mismatch", "join_rejected", "world_snapshot",
+])
+
 # v9.12: 协议版本协商（研究: MCP handshake / QUIC RFC 9368 兼容协商）
 # 握手时客户端发 PROTO_VERSION，host 校验：不兼容 → version_mismatch 拒绝（防旧 mod 连新 host 错乱）
 PROTO_VERSION = 2            # 协议版本：1=JSON行协议时代, 2=pickle帧协议(当前)
@@ -130,11 +156,35 @@ def _process_incoming():
             # 每条消息的到达与处理完成；默认关闭防刷屏）
             if TRACE_MESSAGES:
                 _log("RECV - {} from Player#{}".format(mtype, sender_pid))
+            # v9.21 P0-5: 房主专属消息权限校验——客机(pid!=0)不得下发房主指令。
+            # 原实现任何对端都能发 kicked/start_game/clock_sync 等，恶意客机可
+            # 踢人/强改时钟/伪造存档同步完成。房主视角下 sender_pid 是客机 pid，
+            # 收到白名单内消息即丢弃；客机视角只连房主，sender_pid 为 None/0 放行。
+            if _is_host and mtype in HOST_ONLY_TYPES and sender_pid not in (None, 0):
+                _log("dropped host-only msg {} from client pid={}".format(mtype, sender_pid))
+                continue
             # v9.13: batch 帧拆开逐个处理（研究: 消息合并——TCP 小消息批处理）
+            # v9.21 P0-3: 防 batch 炸弹——① 拒绝嵌套 batch（否则可指数展开）
+            # ② msgs 条数上限 ③ 展开时尊重队列上限（防单帧把队列打爆）
             if mtype == "batch":
-                for sub in data.get("msgs", []):
-                    if isinstance(sub, dict):
-                        _incoming_queue.put((sub, sender_pid))
+                subs = data.get("msgs", [])
+                if not isinstance(subs, list):
+                    _log("batch msgs not a list, dropped")
+                    continue
+                if len(subs) > MAX_BATCH_MSGS:
+                    _log("batch too large ({} msgs), truncating to {}".format(
+                        len(subs), MAX_BATCH_MSGS))
+                    subs = subs[:MAX_BATCH_MSGS]
+                for sub in subs:
+                    if not isinstance(sub, dict):
+                        continue
+                    if sub.get("type") == "batch":
+                        _log("nested batch rejected")  # 防指数展开
+                        continue
+                    if _incoming_queue.qsize() >= MAX_INCOMING_QUEUE:
+                        _log("queue full while expanding batch, rest dropped")
+                        break
+                    _incoming_queue.put((sub, sender_pid))
                 continue
             if mtype == "chat":
                 _notify("[{}] {}".format(data.get("from", "peer"), data.get("text", "")))
@@ -586,6 +636,46 @@ def _ensure_alarm():
 # _ensure_alarm()  # ← 移除启动时注册
 
 
+def _get_send_lock(sock):
+    """v9.21 P0-1: 取（或创建）某 socket 的发送锁。
+
+    按 id(sock) 索引；连接断开时由 _drop_send_lock 清理，防止字典无界增长。
+    """
+    key = id(sock)
+    lock = _send_locks.get(key)
+    if lock is None:
+        with _send_locks_guard:
+            lock = _send_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                _send_locks[key] = lock
+    return lock
+
+
+def _drop_send_lock(sock):
+    """v9.21 P0-1: 连接结束时清理该 socket 的发送锁（防泄漏）。"""
+    try:
+        with _send_locks_guard:
+            _send_locks.pop(id(sock), None)
+    except Exception:
+        pass
+
+
+def _release_pid(player_id):
+    """v9.21 P1: 释放 player_id 回复用池（去重 + 上限保护）。
+
+    原实现直接 append 且无上限；异常场景（大量短连接反复接入）下
+    列表会无界增长。超上限时丢弃最旧的（pid 会由 _next_player_id 递增兜底）。
+    """
+    if player_id is None:
+        return
+    if player_id in _released_pids:
+        return
+    _released_pids.append(player_id)
+    while len(_released_pids) > MAX_RELEASED_PIDS:
+        _released_pids.pop(0)
+
+
 def _send_json(sock, payload, prio=1):
     """发送消息（v7.2: pickle 二进制 + 8 字节长度前缀，ts4mp 同款）
 
@@ -611,8 +701,11 @@ def _send_json(sock, payload, prio=1):
         else:
             key = _hmac_keys.get(_my_player_id)
         sig = _sign_frame(data, key)
-        sock.sendall(pack('>QI', len(data), crc) + sig)
-        sock.sendall(data)
+        # v9.21 P0-1: 整帧写入必须串行——帧头与数据分两次 sendall，
+        # 并发线程交错会拼出撕裂帧（收端 CRC/HMAC 失败静默丢帧）。
+        with _get_send_lock(sock):
+            sock.sendall(pack('>QI', len(data), crc) + sig)
+            sock.sendall(data)
         return True
     except Exception as e:
         _log("send error: {}".format(e))
@@ -812,12 +905,21 @@ def _recv_loop(sock, is_client=False, player_id=None):
                     # 只反序列化信任的联机对端数据（局域网/房主-客机场景，
                     # 双方都运行同一个 mod；pickle 用于性能，JSON 已实测慢 2.8x）
                     msg = pickle.loads(frame_data)
+                    # v9.21 P0-4: 入站队列上限——对端异常高频发送/洪泛时，
+                    # 无界队列会吃满内存（主线程 alarm 每 500ms 才消费一次）。
+                    # 超限丢弃最新消息并记日志（保留已排队的旧消息，避免状态断裂）。
+                    if _incoming_queue.qsize() >= MAX_INCOMING_QUEUE:
+                        _log("incoming queue full ({}), dropping {}".format(
+                            MAX_INCOMING_QUEUE, msg.get("type") if isinstance(msg, dict) else "?"))
+                        continue
                     _incoming_queue.put((msg, player_id))
                 except Exception as e:
                     _log("unpickle error: {}".format(e))
         except Exception as e:
             _log("recv error: {}".format(e))
             break
+    # v9.21 P0-1/P0-2: 连接收尾统一清理 per-socket 发送锁（防字典泄漏）
+    _drop_send_lock(sock)
     if is_client:
         # v9.19.1: 仅当断开的就是当前连接才清空/调度重连。
         # 旧 _recv_loop 线程收尾时若已有新连接（手动重连/外部替换），
@@ -843,8 +945,13 @@ def _recv_loop(sock, is_client=False, player_id=None):
             if cur is not None and cur[0] is sock:
                 _clients.pop(player_id, None)
                 # v9.12: player_id 复用池（重连复用原 ID，防递增→KeyError）
-                if player_id not in _released_pids:
-                    _released_pids.append(player_id)
+                # v9.21 P1: 走 _release_pid（去重 + 上限保护）
+                _release_pid(player_id)
+                # v9.21 P0-2: 清理该 pid 的会话密钥——原实现只在握手时写入、
+                # 永不清理：① 字典随连接数无界增长（泄漏）；② pid 被新连接复用后，
+                # 新客机在完成握手派生新 key 之前，收端会用【旧 key】验签它的帧 →
+                # HMAC mismatch 静默丢帧（重连后消息神秘消失）。
+                _hmac_keys.pop(player_id, None)
                 disconnected = True
         if disconnected:
             try:
@@ -963,8 +1070,10 @@ def _server_thread(port=DEFAULT_PORT):
                             pass
                         with _clients_lock:
                             _clients.pop(old_pid, None)
-                            if old_pid not in _released_pids:
-                                _released_pids.append(old_pid)
+                            # v9.21 P1/P0-2: 上限保护的 pid 释放 + 清理旧会话密钥
+                            # （不清理会让复用该 pid 的新客机被旧 key 验签 → 静默丢帧）
+                            _release_pid(old_pid)
+                            _hmac_keys.pop(old_pid, None)
                         # 继续接受新连接（不 continue）
                 except Exception as e:
                     _log("dup check error: {}".format(e))
@@ -992,8 +1101,17 @@ def _server_thread(port=DEFAULT_PORT):
                     pass
                 threading.Thread(target=_handle_client, args=(conn, addr), daemon=True).start()
             except Exception as e:
-                _log("accept error: {}".format(e))
-                break
+                # v9.21 P1: accept 失败不再无条件退出监听循环——
+                # 原实现任何异常都 break，一次瞬时错误（EMFILE/ECONNABORTED、
+                # 客机在握手前立刻断开）就会让房主永久停止接受新连接，
+                # 表现为"房主还在但没人能进来"，只能重启游戏。
+                # 仅在 socket 已关闭（房主主动停止）时退出。
+                if _server_socket is None:
+                    _log("accept loop stopped (server socket closed)")
+                    break
+                _log("accept error (continuing): {}".format(e))
+                time.sleep(0.2)   # 防紧密错误循环刷屏
+                continue
     except Exception as e:
         _log("server error: {}".format(e))
 

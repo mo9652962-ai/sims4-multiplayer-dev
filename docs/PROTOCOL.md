@@ -107,6 +107,39 @@
 |:-----|:-----|:-----|:-----|
 | `batch` | H↔C | msgs | 多条消息合并帧（v9.13）|
 
+**batch 防护（v9.21）**：
+- 嵌套 `batch` 一律拒绝（防指数展开）
+- `msgs` 必须是 list，条数上限 `MAX_BATCH_MSGS = 256`（超出截断）
+- 展开时遵守入站队列上限，队列满则丢弃剩余
+
+## 消息权限与流控（v9.21）
+
+### 房主专属消息（HOST_ONLY_TYPES）
+房主收到下列消息时，若 `sender_pid` 不是 0/None（即来自客机）则**直接丢弃**，
+防恶意客机冒充房主踢人 / 强改时钟 / 伪造存档同步完成：
+
+`welcome`、`kicked`、`start_game`、`clock_sync`、`save_sync_req`、`save_chunk`、
+`save_chunk_done`、`save_sync_done`、`travel_go`、`travel_all_arrived`、
+`travel_missing`、`host_migrated`、`version_mismatch`、`join_rejected`、`world_snapshot`
+
+### 流控上限
+| 常量 | 值 | 作用 |
+|:-----|:---|:-----|
+| `MAX_FRAME_SIZE` | 8 MB | 单帧上限（v9.3，防超大帧内存 DoS）|
+| `MAX_BATCH_MSGS` | 256 | 单个 batch 最多展开条数（v9.21）|
+| `MAX_INCOMING_QUEUE` | 4096 | 入站队列上限，超限丢新消息并记日志（v9.21）|
+| `MAX_RELEASED_PIDS` | 64 | player_id 复用池上限（v9.21）|
+
+### 帧写入串行化（v9.21）
+一帧由两次 `sendall`（44 字节帧头 + pickle 数据）写出，多线程并发发往同一
+socket 会交错拼出撕裂帧（收端 CRC/HMAC 失败静默丢帧）。`_send_json` 按
+socket 粒度加锁（`_get_send_lock`），连接结束时 `_drop_send_lock` 清理。
+
+### 会话密钥生命周期（v9.21）
+`_hmac_keys[pid]` 在客户端断开 / 踢旧接新时清理。不清理会导致：
+① 字典随连接数无界增长；② pid 被新连接复用后，新客机握手派生新 key 之前
+收端用旧 key 验签 → HMAC mismatch 静默丢帧。
+
 ## 版本兼容规则
 
 | 版本 | 变更 |
@@ -115,5 +148,8 @@
 | 1 | JSON 行协议（旧，不再兼容）|
 
 **规则**：PROTO_VERSION 不匹配 → hello 被拒（version_mismatch），客户端提示更新。
+
+> v9.21 的强化均为**同协议版本内的收端校验与流控**（不改帧格式、不改消息语义），
+> 因此 `PROTO_VERSION` 保持 2，与 v9.20.x 客户端互通。
 
 | `world_snapshot` | host→client | 登录全量快照（时间/位置/资金），新成员加入时立即对齐 |

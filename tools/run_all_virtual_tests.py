@@ -35,6 +35,7 @@ SUITES = [
     ("virtual_test_v916.py", "跨网安全: HMAC消息签名/握手密钥交换"),
     ("virtual_test_v917.py", "深度同步: 交互队列/背包/关系/Buy家具"),
     ("virtual_test_v918.py", "启动器房间: 建房/加入/准备/存档同步/开始游戏"),
+    ("virtual_test_v921.py", "强化验证: 发送锁/HMAC生命周期/batch防护/队列上限/权限/accept健壮/pid池/位置基准"),
 ]
 
 

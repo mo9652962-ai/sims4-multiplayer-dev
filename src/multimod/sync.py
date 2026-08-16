@@ -158,6 +158,27 @@ _pos_seq = 0  # v7.0: 位置广播序号（丢包检测）
 _delta_base = {}  # v8.1: delta 压缩基准（sim_id → 绝对坐标）
 
 
+def reset_pos_baseline(reason=""):
+    """v9.21 P1: 重置位置广播基准，强制下一包发绝对坐标。
+
+    修复「新客机/重连客机永远看不到别人移动」：
+    发送端只在 `_pos_seq <= 1` 时发绝对坐标，之后一直发 delta；
+    而接收端没有基准时会丢弃 delta（"delta without base"）。
+    于是任何在会话中途接入的客机都拿不到基准 → 位置永久不同步，
+    且发送端永不自愈（`_last_broadcast_pos` 不会自己清空）。
+
+    在「有新成员加入」「本机重连成功」时调用即可让下一包重新建立基准。
+    """
+    global _last_broadcast_pos, _pos_seq, _delta_base
+    _last_broadcast_pos = None
+    _pos_seq = 0
+    _delta_base = {}
+    try:
+        network._log("sync: pos baseline reset ({})".format(reason or "manual"))
+    except Exception:
+        pass
+
+
 def _get_active_sim():
     """获取当前控制的 sim"""
     try:

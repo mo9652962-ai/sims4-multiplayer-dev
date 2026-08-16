@@ -1192,6 +1192,14 @@ def process_message(data, sender_pid=None):
                         network._send_world_snapshot(sock)
                     except Exception as e:
                         network._log("world_snapshot send error: {}".format(e))
+                    # v9.21 P1: 新成员加入 → 重置位置基准，下一包发绝对坐标。
+                    # 否则新客机只收到 delta 而无基准，会一直丢弃（"delta without
+                    # base"）→ 中途加入的人永远看不到别人移动。
+                    try:
+                        from multimod import sync
+                        sync.reset_pos_baseline("member joined pid={}".format(sender_pid))
+                    except Exception as e:
+                        network._log("pos baseline reset error: {}".format(e))
             return
 
         if mtype == "join_rejected":
@@ -1240,6 +1248,14 @@ def process_message(data, sender_pid=None):
             # 向主机上报自己的进图状态（若已在家庭地段）
             _write_state_file()
             start_heartbeat()  # M3d 增强: 客户端开始心跳
+            # v9.21 P1: 客机（含重连）握手完成 → 重置位置基准。
+            # 重连后本机 _last_broadcast_pos 仍是旧值 → 只会发 delta，
+            # 而房主端的基准可能已随断线失效 → 双向位置都不同步。
+            try:
+                from multimod import sync
+                sync.reset_pos_baseline("client welcome pid={}".format(network._my_player_id))
+            except Exception as e:
+                network._log("pos baseline reset error: {}".format(e))
             return
 
         if mtype == "lobby":

@@ -2,7 +2,7 @@
 chcp 65001 >nul
 title Sims4Multiplayer 联机启动器
 echo ========================================
-echo   Sims4Multiplayer 联机启动器 v9.20.5
+echo   Sims4Multiplayer 联机启动器 v9.21.0
 echo ========================================
 echo.
 
