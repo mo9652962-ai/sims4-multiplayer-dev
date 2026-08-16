@@ -123,7 +123,7 @@ client 侧按本机 `_my_player_id` 查 key。
 
 ---
 
-## 4. 消息目录（游戏内协议，全量 41 种）
+## 4. 消息目录（游戏内协议，全量 42 种）
 
 约定：方向 H→C 表示房主发给客机（实际为广播或定向）；H↔C 双向。
 "处理"列为接收端实际分发目标。标注 ⚠️dead 的消息：分发表中存在但无 handler，静默丢弃。
@@ -153,7 +153,7 @@ client 侧按本机 `_my_player_id` 查 key。
 > hello 校验通过后 lobby.on_hello 再发一份。客机两次都处理（第二次重复派生 key + 
 > 重复启动心跳线程，见已知问题 M-1）。
 
-### 4.2 旅行/场景切换（6）
+### 4.2 旅行/场景切换（7）
 
 | type | 方向 | 字段 | prio | 处理 | 说明 |
 |:-----|:-----|:-----|:-----|:-----|:-----|
@@ -161,8 +161,14 @@ client 侧按本机 `_my_player_id` 查 key。
 | `travel_ack` | C→H | `ts:float` | 0 | ⚠️route→lobby.on_travel_ack | 客机确认就绪 |
 | `travel_go` | H→C | `ts:float` | 1 | ⚠️route→lobby.on_travel_go | 全员放行，进入旅行锁定 |
 | `travel_arrived` | C→H | `player:int`、`zone_id` | 1 | ⚠️route→lobby.on_travel_arrived | 进图后自动上报（v9.22） |
-| `travel_all_arrived` | H→C | `ts:float` | 1 | lobby：解除锁定 + 刷新 world_snapshot | v9.11 |
+| `travel_all_arrived` | H→C | `ts:float` | 1 | lobby：解除锁定 + 恢复时钟 + 刷新 world_snapshot | v9.11 |
 | `travel_missing` | H→C | `missing:[pid]` | 1 | lobby：超时解锁提示 | v9.11 |
+| `travel_follow` | H→C | `zone_id:int`、`ts:float` | 1 | ⚠️route→lobby.on_travel_follow | HOST_ONLY（v9.24）：主机 zone 变化 → 客机 `send_travel_switch_to_zone_op` 自动跟随 |
+
+> v9.24 游戏内旅行自动跟随：主机每 tick 检查 `services.current_zone_id()`（首读做基线），
+> 玩家在游戏内正常旅行即触发 `travel_follow` 广播 + 锁时钟；客机调原生 API 自动切
+> 同一 zone，进图后走 v9.22 的 `auto_report_arrival` 闭环（全员到齐恢复时钟/刷新快照）。
+> `mp_follow_travel` 命令可切开关（默认开）。
 
 旅行定时策略（host 侧）：发起后 10s 强制放行；go 后 30/60s 广播进度、90s 超时解锁。
 
@@ -213,7 +219,8 @@ client 侧按本机 `_my_player_id` 查 key。
 ```
 welcome, kicked, start_game, clock, save_sync_req, save_chunk,
 save_chunk_done, save_sync_done, travel_go, travel_all_arrived,
-travel_missing, host_migrated, version_mismatch, join_rejected, world_snapshot
+travel_missing, travel_follow, host_migrated, version_mismatch,
+join_rejected, world_snapshot
 ```
 
 > ⚠️ 遗漏（KNOWN-N3）：`lobby`、`travel_req`、`save_resend_req` 不在名单内，

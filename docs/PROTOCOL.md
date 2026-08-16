@@ -1,4 +1,4 @@
-# 📡 Sims4Multiplayer 协议消息目录（v9.13）
+# 📡 Sims4Multiplayer 协议消息目录（v9.24）
 
 > 借鉴: Kafka Schema Registry——集中管理消息 schema，强制兼容规则
 > 传输: TCP + pickle 二进制帧（8 字节大端长度前缀 + pickle）
@@ -46,7 +46,7 @@
 - 相同输入 → 相同 key（无需传输密钥，防中间人伪造）
 - 多客户端各自独立 key（`_hmac_keys[pid]`，互不通用）
 - 房间无密码时 key 由 nonce 唯一决定（防重放）
-## 消息总表（32 种）
+## 消息总表（37 种）
 
 ### 房间/生命周期（14）
 | 类型 | 方向 | 字段 | 用途 |
@@ -66,14 +66,14 @@
 | `members` / `members_ack` | H↔C | - | 成员同步确认 |
 | `lobby_join` | C→H | - | 加入请求 |
 
-### 旅行/场景切换（6）
+### 旅行/场景切换（7）
 | 类型 | 方向 | 字段 | 用途 |
 |:-----|:-----|:-----|:-----|
 | `travel_req` | H→C | ts | 发起旅行（双端确认）|
 | `travel_ack` | C→H | ts | 确认旅行就绪 |
 | `travel_go` | H→C | ts | 全员放行 |
 | `travel_arrived` | C→H | player, zone_id | 抵达新场景报告（v9.11）|
-| `travel_follow` | H→C | zone_id | 主机旅行跟随（v9.24）：主机 zone 变化 → 广播全员自动跟随 |
+| `travel_follow` | H→C | zone_id, ts | 主机旅行跟随（v9.24，HOST_ONLY）：主机 zone 变化 → 广播全员自动跟随 |
 | `travel_all_arrived` | H→C | ts | 全员抵达确认（v9.11）|
 | `travel_missing` | H→C | missing | 旅行超时提示（v9.11）|
 
@@ -93,6 +93,16 @@
 > 时钟速度——丢失的 clock 更新由下一周期重播自愈（客机 apply 幂等）。
 > 另：主线程每 tick 最多处理 `MAX_MSGS_PER_TICK=200` 条消息（防洪泛卡帧，
 > 余量顺延下一 tick）；网络线程看门狗每 10s 检查线程存活，死亡自动重启。
+>
+> **v9.24 游戏内旅行自动跟随**（`travel_follow`，全程无需命令）：
+> - 主机每 tick 检查 `services.current_zone_id()`（首读只做基线），玩家在游戏里
+>   正常旅行（手机选地点/点地图/拜访）→ zone 变化即广播 `travel_follow{zone_id}`
+>   并锁时钟（保存原速、广播 speed=0）
+> - 客机收到后调原生 API `sim_info.send_travel_switch_to_zone_op(zone_id)` 自动
+>   切同一 zone（反编译 `sims.visit_target_sim` 确认入口）；失败则提示手动旅行
+> - 各端进图后走 v9.22 `auto_report_arrival` 上报，全员到齐自动恢复时钟 +
+>   刷新 world_snapshot；同样有 30/60/90s 分级超时兜底
+> - `mp_follow_travel` 命令可切开关（默认开）；已列入 HOST_ONLY_TYPES
 
 ### 同步数据（6）
 | 类型 | 方向 | 字段 | 用途 |
@@ -138,7 +148,8 @@
 
 `welcome`、`kicked`、`start_game`、`clock`、`save_sync_req`、`save_chunk`、
 `save_chunk_done`、`save_sync_done`、`travel_go`、`travel_all_arrived`、
-`travel_missing`、`host_migrated`、`version_mismatch`、`join_rejected`、`world_snapshot`
+`travel_missing`、`travel_follow`、`host_migrated`、`version_mismatch`、
+`join_rejected`、`world_snapshot`
 
 > v9.22 修复：原列表中 `clock_sync` 是笔误（线上消息类型为 `clock`）——
 > 白名单此前从未对时钟消息生效，恶意客机可改主机时间。

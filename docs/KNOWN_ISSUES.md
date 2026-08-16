@@ -438,8 +438,8 @@ def on_save_sync_ack(sender_pid, data):
 
 ### H-4【P1】旅行 Timer 句柄被丢弃——旧旅行定时器打断新旅行
 
-- 位置：`lobby.py:885、918-920`。
-- 修复（H-3/H-4 合并：代次 + 句柄保存 + UI 调用回主线程）：
+- 位置：`lobby.py:885、918-920`；v9.24 的 `on_host_zone_changed`（travel_follow 路径）同样裸起 30/60/90s Timer，共患此问题。
+- 修复（H-3/H-4 合并：代次 + 句柄保存 + UI 调用回主线程；`on_host_zone_changed` 与 `host_start_travel` 走同一套 `_travel_gen`/`_cancel_travel_timers`）：
 
 ```python
 # lobby.py 模块级：
