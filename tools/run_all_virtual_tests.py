@@ -39,6 +39,7 @@ SUITES = [
     ("virtual_test_v922.py", "v9.22回归: clock白名单/per-conn nonce/握手前帧策略/旅行增强/反向索引/命令桥"),
     ("virtual_test_v923.py", "v9.23稳定性: 消息预算/周期状态自愈/旅行时钟锁定/健康度/看门狗"),
     ("virtual_test_v924.py", "v9.24游戏内旅行: zone变化检测/travel_follow自动跟随/原生API/开关/防伪造"),
+    ("virtual_test_v925.py", "v9.25旅行代次: 连续旅行定时器竞态(集中取消+代次守卫)"),
     ("virtual_test_api_shape.py", "API形状校验: 反编译pyc名单比对+源码静态扫描(防虚拟绿/游戏炸)"),
 ]
 

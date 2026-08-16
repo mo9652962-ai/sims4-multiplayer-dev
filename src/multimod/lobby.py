@@ -865,6 +865,48 @@ _travel_saved_speed = 1     # v9.23: 旅行前主机时钟速度（到齐后恢�
 _follow_travel = True       # v9.24: 游戏内旅行自动跟随（主机 zone 变化 → 全员
                             # 自动切同一 zone——反编译 sims.visit_target_sim 确认
                             # sim_info.send_travel_switch_to_zone_op 为原生入口）
+_travel_gen = 0             # v9.25: 旅行代次——连续旅行/快速切场景时，旧旅行的
+                            # 30/60/90s Timer 还挂着；新旅行开始后旧 Timer 触发会
+                            # 提前解锁新旅行/乱发 travel_missing/错乱恢复时钟。
+                            # 每个 Timer 捕获启动时的代次，触发时代次不匹配即 no-op。
+_travel_timers = []         # v9.25: 当前旅行的分级 Timer（集中取消用）
+
+
+def _cancel_travel_timers():
+    """v9.25: 集中取消当前旅行的所有分级 Timer。
+
+    调用时机：新旅行开始（作废旧 Timer）/ 旅行正常结束 / 超时终局 / 房间重置。
+    """
+    global _travel_timers
+    timers = _travel_timers
+    _travel_timers = []
+    for t in timers:
+        try:
+            t.cancel()
+        except Exception:
+            pass
+
+
+def _start_travel_timers():
+    """v9.25: 统一启动 30/60/90s 分级超时（代次捕获——旧代次触发时 no-op）。
+
+    原实现 force_start / on_host_zone_changed 各自裸起 Timer 且从不取消：
+    连续旅行时旧 90s Timer 在新旅行中途触发 → 提前解锁 + 乱发超时 + 恢复时钟。
+    Timer 设 daemon——游戏退出不被残留定时器阻塞。
+    """
+    global _travel_timers
+    _cancel_travel_timers()
+    gen = _travel_gen
+    try:
+        import threading
+        for delay, final in ((30.0, False), (60.0, False), (90.0, True)):
+            t = threading.Timer(
+                delay, lambda g=gen, f=final: _travel_progress_check(f, gen=g))
+            t.daemon = True
+            _travel_timers.append(t)
+            t.start()
+    except Exception as e:
+        network._log("travel timers start error: {}".format(e))
 
 
 def on_host_zone_changed(new_zone_id):
@@ -875,7 +917,7 @@ def on_host_zone_changed(new_zone_id):
     各端进图后 auto_report_arrival（v9.22）→ 全员到齐自动恢复时钟+刷新快照
     （v9.23）。玩家全程不需要输任何命令。
     """
-    global _travel_active, _travel_arrived, _travel_go_ts, _travel_saved_speed
+    global _travel_active, _travel_arrived, _travel_go_ts, _travel_saved_speed, _travel_gen
     if not _follow_travel:
         network._log("lobby: follow travel off, host zone change ignored")
         return
@@ -885,6 +927,7 @@ def on_host_zone_changed(new_zone_id):
     _travel_active = True
     _travel_arrived = {0}  # 房主已在路上
     _travel_go_ts = time.time()
+    _travel_gen += 1  # v9.25: 新旅行代次（作废旧 Timer）
     # 时钟锁定（同 _travel_force_start）
     try:
         from multimod import clock_sync
@@ -901,15 +944,10 @@ def on_host_zone_changed(new_zone_id):
     network._broadcast({"type": "travel_follow", "zone_id": int(new_zone_id),
                         "ts": time.time()})
     _notify("🧳 检测到你的旅行，成员正在自动跟随...")
-    network._log("lobby: travel_follow broadcast zone={}".format(new_zone_id))
-    # 分级超时（同 travel_go 路径）
-    try:
-        import threading
-        threading.Timer(30.0, lambda: _travel_progress_check(False)).start()
-        threading.Timer(60.0, lambda: _travel_progress_check(False)).start()
-        threading.Timer(90.0, lambda: _travel_progress_check(True)).start()
-    except Exception:
-        pass
+    network._log("lobby: travel_follow broadcast zone={} (gen={})".format(
+        new_zone_id, _travel_gen))
+    # v9.25: 分级超时统一走 _start_travel_timers（代次捕获 + 取消旧 Timer）
+    _start_travel_timers()
     _write_state_file()
 
 
@@ -1014,13 +1052,15 @@ def on_travel_ack(player_id):
 
 def _travel_force_start():
     """全部确认（或超时）→ 通知所有成员开始加载"""
-    global _travel_pending, _travel_active, _travel_arrived, _travel_go_ts, _travel_saved_speed
+    global _travel_pending, _travel_active, _travel_arrived, _travel_go_ts
+    global _travel_saved_speed, _travel_gen
     if not _travel_pending:
         return
     _travel_pending = False
     _travel_active = True  # 场景切换锁定开始
     _travel_arrived = {0} if network._is_host else set()  # 房主自己视为"出发中"
     _travel_go_ts = time.time()
+    _travel_gen += 1  # v9.25: 新旅行代次（作废旧 Timer）
     # v9.23: 旅行期间锁定时钟（广播 PAUSED）——场景加载时客机无法处理游戏
     # tick，若主机时间继续走会造成加载后时间不一致；到齐/超时后恢复原速。
     try:
@@ -1040,14 +1080,10 @@ def _travel_force_start():
     for m in _members.values():
         m["in_lot"] = False
     _notify("✅ 全员确认完毕，可以同时旅行了！")
-    network._log("lobby: travel go")
+    network._log("lobby: travel go (gen={})".format(_travel_gen))
     network._broadcast({"type": "travel_go", "ts": _travel_go_ts})
-    # v9.22: 分级超时（30/60/90s）——30/60s 只提示进度（在等谁），
-    # 90s 才解除锁定。原实现 90s 内零反馈，卡住的玩家不知道在等谁。
-    import threading
-    threading.Timer(30.0, lambda: _travel_progress_check(False)).start()
-    threading.Timer(60.0, lambda: _travel_progress_check(False)).start()
-    threading.Timer(90.0, lambda: _travel_progress_check(True)).start()
+    # v9.25: 分级超时统一走 _start_travel_timers（代次捕获 + 取消旧 Timer）
+    _start_travel_timers()
     _write_state_file()
 
 
@@ -1096,6 +1132,7 @@ def _check_travel_all_arrived():
         return
     if _travel_arrived.issuperset(set(_members.keys())):
         _travel_active = False
+        _cancel_travel_timers()  # v9.25: 正常结束集中取消
         _notify("✅ 全员已到达新场景，继续游戏！")
         network._log("lobby: travel all arrived")
         network._broadcast({"type": "travel_all_arrived", "ts": time.time()})
@@ -1112,9 +1149,18 @@ def _check_travel_all_arrived():
         _write_state_file()
 
 
-def _travel_progress_check(final):
-    """房主：go 后分级检查（v9.22: 30/60s 进度提示 / 90s 超时解除锁定）"""
+def _travel_progress_check(final, gen=None):
+    """房主：go 后分级检查（v9.22: 30/60s 进度提示 / 90s 超时解除锁定）
+
+    v9.25: gen 代次守卫——Timer 捕获启动时的代次，若新旅行已开始（代次已变）
+    则本检查作废（否则旧 90s Timer 会提前解锁新旅行/乱发 travel_missing/
+    错乱恢复时钟——连续旅行/快速切场景必现）。gen=None 表示直接调用
+    （测试/手动），作用于当前代次。
+    """
     global _travel_active
+    if gen is not None and gen != _travel_gen:
+        network._log("lobby: stale travel timer ignored (gen {} != {})".format(gen, _travel_gen))
+        return
     if not _travel_active:
         return
     # v9.20.5: 成员字典可能缺 player_id 字段（旧状态文件/异常写入）——
@@ -1131,6 +1177,7 @@ def _travel_progress_check(final):
         _write_state_file()
         return
     _travel_active = False
+    _cancel_travel_timers()  # v9.25: 终局集中取消
     _notify("⚠️ 旅行超时：{} 未到达，已解除锁定".format(", ".join(missing)))
     network._log("lobby: travel missing: {}".format(missing))
     network._broadcast({"type": "travel_missing", "missing": missing})
@@ -1765,6 +1812,7 @@ def reset_room_state():
     global _members, ROOM_CODE, ROOM_VISIBILITY, ROOM_PASSWORD
     global _save_sync_phase, _start_granted
     global _travel_active, _travel_arrived, _travel_board, _travel_pending, _travel_acks
+    global _travel_gen
     _members = {}
     ROOM_CODE = ""
     ROOM_VISIBILITY = "public"
@@ -1777,6 +1825,9 @@ def reset_room_state():
     _travel_board = None
     _travel_pending = False
     _travel_acks = set()
+    # v9.25: 取消挂着的旅行 Timer + 代次自增作废游离定时器
+    _travel_gen += 1
+    _cancel_travel_timers()
     # v9.24: 主机 zone 基线重置（新会话首次进图重新建基线，不算旅行）
     try:
         network._last_zone_id = None

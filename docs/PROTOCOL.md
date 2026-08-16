@@ -103,6 +103,14 @@
 > - 各端进图后走 v9.22 `auto_report_arrival` 上报，全员到齐自动恢复时钟 +
 >   刷新 world_snapshot；同样有 30/60/90s 分级超时兜底
 > - `mp_follow_travel` 命令可切开关（默认开）；已列入 HOST_ONLY_TYPES
+>
+> **v9.25 旅行代次（`_travel_gen`）**：连续旅行/快速切场景时，旧旅行的
+> 30/60/90s Timer 仍挂着——新旅行开始后旧 Timer 触发会提前解锁新旅行 /
+> 乱发 `travel_missing` / 错乱恢复时钟。修复：①每次旅行开始代次自增，
+> Timer 捕获启动时代次，触发时代次不匹配即 no-op；②`_cancel_travel_timers`
+> 在 新旅行开始 / 全员到齐 / 超时终局 / 房间重置 四处集中取消；③Timer
+> 全部 daemon 化（游戏退出不被残留定时器阻塞）。`travel_go` 与
+> `travel_follow` 两条路径统一走 `_start_travel_timers`。
 
 ### 同步数据（6）
 | 类型 | 方向 | 字段 | 用途 |
