@@ -945,8 +945,13 @@ def _server_thread(port=DEFAULT_PORT):
                 # 若拒绝新连接 → 客机永远连不上(重连风暴全部被拒)。
                 # 策略: 踢旧接新——关闭旧连接, 释放旧 pid, 接受新连接。
                 try:
-                    with _clients_lock:
-                        dup = [pid for pid, (s, a) in _clients.items() if a[0] == addr[0]]
+                    # v9.20.5: ALLOW_SELF 调试模式下同一 127.0.0.1 会有多个合法客机
+                    # （单机多客户端虚拟测试），此时不能按 IP 去重，否则新客机互相踢掉。
+                    if ALLOW_SELF and addr[0] == "127.0.0.1":
+                        dup = []
+                    else:
+                        with _clients_lock:
+                            dup = [pid for pid, (s, a) in _clients.items() if a[0] == addr[0]]
                     if dup:
                         old_pid = dup[0]
                         _log("duplicate connection from {} (existing pid={}), replacing old".format(addr[0], old_pid))

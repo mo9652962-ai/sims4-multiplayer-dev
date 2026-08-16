@@ -933,8 +933,11 @@ def _travel_check_missing():
     global _travel_active
     if not _travel_active:
         return
-    missing = [m["name"] for m in _members.values()
-               if m["player_id"] not in _travel_arrived]
+    # v9.20.5: 成员字典可能缺 player_id 字段（旧状态文件/异常写入）——
+    # 用字典 key 作为权威 pid，避免 KeyError 打死定时器线程。
+    missing = [m.get("name", "玩家{}".format(pid))
+               for pid, m in list(_members.items())
+               if m.get("player_id", pid) not in _travel_arrived]
     if missing:
         _travel_active = False
         _notify("⚠️ 旅行超时：{} 未到达，已解除锁定".format(", ".join(missing)))
@@ -1419,12 +1422,12 @@ def mp_lobby(_connection=None):
     """查看房间状态"""
     output = sims4.commands.CheatOutput(_connection)
     output("=== 房间状态 ({}人) 房间码: {} ===".format(len(_members), ROOM_CODE or "无"))
-    for m in _members.values():
+    for pid, m in list(_members.items()):
         output("  [{}] {} 准备={} 进图={} 在线={} {}".format(
-            "房主" if m["is_host"] else "成员", m["name"],
-            "✅" if m["ready"] else "❌", "✅" if m["in_lot"] else "❌",
+            "房主" if m.get("is_host") else "成员", m.get("name", "玩家{}".format(pid)),
+            "✅" if m.get("ready") else "❌", "✅" if m.get("in_lot") else "❌",
             "🟢" if m.get("online") else "⚫",
-            "(本机)" if m["player_id"] == network._my_player_id else ""))
+            "(本机)" if m.get("player_id", pid) == network._my_player_id else ""))
     output("存档同步: {} | 开始权: {}".format(_save_sync_phase, _start_granted))
     network._log("mp_lobby: {} members".format(len(_members)))
 

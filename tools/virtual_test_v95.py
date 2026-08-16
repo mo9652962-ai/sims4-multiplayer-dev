@@ -132,10 +132,27 @@ net_thread.start()
 time.sleep(1.0)
 
 ok_re = 0
+
+
+def _wait_connect_slot(timeout=3.0):
+    """等待 _client_connecting 标志释放（上一个连接线程收尾完成）。
+
+    v9.20.5: 生产逻辑里防重入标志由 _client_thread 的 finally 重置；
+    测试快速连断时必须等它释放，否则新连接会被判为重复触发而跳过。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not network._client_connecting:
+            return True
+        time.sleep(0.05)
+    return False
+
+
 for i in range(20):
     try:
         # client 连接
         network._is_host = False
+        _wait_connect_slot()
         cli = threading.Thread(target=network._client_thread, args=('127.0.0.1', PORT_C), daemon=True)
         cli.start()
         time.sleep(0.5)
@@ -146,6 +163,7 @@ for i in range(20):
         except Exception: pass
         network._client_socket = None
         # 重连
+        _wait_connect_slot()
         cli2 = threading.Thread(target=network._client_thread, args=('127.0.0.1', PORT_C), daemon=True)
         cli2.start()
         time.sleep(0.5)

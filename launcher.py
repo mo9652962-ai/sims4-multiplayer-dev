@@ -24,7 +24,7 @@ import time
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
-APP_VERSION = "9.20.1"
+APP_VERSION = "9.20.5"
 APP_REPO = "mo9652962-ai/second-brain"  # v8.5: GitHub 自动更新检查源
 UPDATE_URL = "https://api.github.com/repos/{}/releases/latest".format(APP_REPO)
 DEFAULT_GAME_DIR = r"D:\Games\The Sims 4"
