@@ -24,6 +24,7 @@
 """
 import base64
 import hashlib
+import hmac
 import json
 import os
 import random
@@ -194,8 +195,9 @@ class RoomServer:
             if code and code != self.room_code:
                 self._send(conn, {"type": "join_rejected", "reason": "房间码错误"})
                 return
-            # v9.18: 密码验证
-            if self.password and str(msg.get("password", "")) != self.password:
+            # v9.18: 密码验证（v9.19: hmac.compare_digest 恒定时间比对防时序攻击）
+            if self.password and not hmac.compare_digest(
+                    str(msg.get("password", "")), self.password):
                 self._send(conn, {"type": "join_rejected", "reason": "房间密码错误"})
                 return
             with self._lock:
