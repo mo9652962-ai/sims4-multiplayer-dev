@@ -14,9 +14,37 @@ import json
 import queue
 import os
 import time
+import io
+import pickle  # v9.23: _SafeUnpickler 基类
 import binascii  # v9.15: CRC32 帧校验（Ethernet FCS 标准）
 import hmac as _hmac_mod  # v9.16: HMAC 消息签名（RFC 2104——跨网防伪造/篡改）
 import hashlib
+
+
+# ============ v9.23: 安全反序列化（防 pickle RCE） ============
+class _SafeUnpickler(pickle.Unpickler):
+    """限制 pickle 只能加载基础数据类型（str/dict/list/int/float/bool/None/tuple/bytes）。
+    恶意 payload 无法通过 __reduce__ 加载 os.system 等任意类 → RCE 消除。
+    协议保持兼容（帧格式不变），性能几乎无损耗。
+    v9.23-fix: 子类重写 find_class（Python 3.11 禁止对实例属性赋值）。"""
+
+    _ALLOWED = {
+        "builtins": {
+            "str", "dict", "list", "int", "float", "bool",
+            "NoneType", "tuple", "bytes", "set", "frozenset",
+        }
+    }
+
+    def find_class(self, module, name):
+        if module in self._ALLOWED and name in self._ALLOWED[module]:
+            return getattr(__import__(module), name)
+        raise pickle.UnpicklingError(
+            "forbidden class in frame: {}.{}".format(module, name))
+
+
+def _safe_loads(data):
+    """安全反序列化（v9.23: 替代裸 pickle.loads——防 RCE）"""
+    return _SafeUnpickler(io.BytesIO(data)).load()
 
 # ============ 配置 ============
 DEFAULT_PORT = 7655
@@ -885,7 +913,10 @@ def _broadcast(payload, exclude=None, tags=None):
             except Exception:
                 pass
         if _is_host:
-            for pid, (sock, _addr) in list(_clients.items()):
+            # v9.23: 加锁获取客户端快照（防并发断连/接入时字典变更异常）
+            with _clients_lock:
+                target_clients = list(_clients.items())
+            for pid, (sock, _addr) in target_clients:
                 if pid == exclude:
                     continue
                 try:
@@ -976,10 +1007,13 @@ def start_client_discovery():
                         msg = json.loads(data.decode("utf-8"))
                         if msg.get("magic") == DISCOVERY_MAGIC:
                             host_ip = addr[0]
+                            # v9.23: UDP 字段长度截断（防超长 name/room_code 撑爆显示/日志）
+                            raw_name = str(msg.get("name", "?"))[:16]
+                            raw_code = str(msg.get("room_code", ""))[:8].upper()
                             _discovered_rooms[host_ip] = {
-                                "room_code": msg.get("room_code", ""),
-                                "players": msg.get("players", 0),
-                                "name": msg.get("name", "?"),
+                                "room_code": raw_code,
+                                "players": int(msg.get("players", 0) or 0),
+                                "name": raw_name,
                                 "ts": time.time(),
                             }
                             _log("discovered room at {}: {} ({}人) code={}".format(
@@ -1050,18 +1084,23 @@ def _recv_loop(sock, is_client=False, player_id=None):
                     _log("frame CRC mismatch ({}B), dropped".format(frame_len))
                     continue
                 try:
-                    # 只反序列化信任的联机对端数据（局域网/房主-客机场景，
-                    # 双方都运行同一个 mod；pickle 用于性能，JSON 已实测慢 2.8x）
-                    msg = pickle.loads(frame_data)
+                    # v9.23: 安全反序列化（限制类加载白名单——防 pickle RCE）。
+                    # 未认证连接（_key is None）也能安全反序列化基础类型，
+                    # 但业务消息白名单在下方拦截（只允许 hello/welcome）。
+                    msg = _safe_loads(frame_data)
                     # v9.22 P1: 未认证连接（会话密钥未派生）帧上限——握手前只接受
-                    # ≤4KB 的帧，超大帧直接丢弃。说明：消息类型只能 pickle 反序列化
-                    # 之后才能看到，类型白名单挡不住反序列化本身；真正有效的是
-                    # 大小上限（限制注入载荷规模）。语义级防护由 HOST_ONLY 白名单
-                    # 在 _process_incoming 兜底。完整修复需协议 v3 把消息类型提
-                    # 到帧头明文区。
+                    # ≤4KB 的帧，超大帧直接丢弃。
+                    # v9.23: 未认证连接只允许 hello/welcome——其余业务消息
+                    # （money_sync/sim_pos 等）直接丢弃，防未认证注入游戏状态。
                     if _key is None:
                         if frame_len > _PRE_AUTH_MAX_FRAME:
                             _log("pre-auth oversized frame dropped ({}B)".format(frame_len))
+                            continue
+                        if not isinstance(msg, dict):
+                            _log("pre-auth non-dict frame dropped")
+                            continue
+                        if msg.get("type") not in ("hello", "welcome"):
+                            _log("pre-auth non-handshake msg dropped: {}".format(msg.get("type")))
                             continue
                     # v9.21 P0-4: 入站队列上限——对端异常高频发送/洪泛时，
                     # 无界队列会吃满内存（主线程 alarm 每 500ms 才消费一次）。
