@@ -48,14 +48,19 @@ def gen_room_code():
 
 
 def _recv_line(sock, buf):
-    """从缓冲读取一行（\n 结尾），返回 (line, buf)"""
+    """从缓冲读取一行（\n 结尾），返回 (line, buf)
+    v9.19: 缓冲上限 8MB→256KB（单条消息最大 86KB，256KB 足够）"""
     while b"\n" not in buf:
         chunk = sock.recv(65536)
         if not chunk:
             return None, buf
         buf += chunk
-        if len(buf) > 8 * 1024 * 1024:
-            return None, buf
+        if len(buf) > 256 * 1024:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return None, b""
     idx = buf.index(b"\n")
     line = buf[:idx]
     buf = buf[idx + 1:]
@@ -74,6 +79,8 @@ class RoomServer:
         self.members = {0: {"player_id": 0, "name": host_name, "ready": False,
                             "ip": "127.0.0.1", "is_host": True}}
         self._clients = {}  # player_id -> sock
+        self._client_locks = {}  # player_id -> Lock（v9.19: 防并发写 TCP 错乱）
+        self._udp_sock = None  # v9.19: UDP 发现 socket（stop 时主动关）
         self._sock = None
         self._thread = None
         self._lock = threading.Lock()
@@ -93,7 +100,8 @@ class RoomServer:
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._thread.start()
         # v9.18: UDP 局域网发现（让加入者不用手动输 IP）
-        _start_discovery_listener(self, self.host_name, self.room_code)
+        # v9.19: socket 绑定到实例（stop 时主动关）
+        self._udp_sock = _start_discovery_listener(self, self.host_name, self.room_code)
         return True
 
     def stop(self):
@@ -101,6 +109,12 @@ class RoomServer:
         try:
             if self._sock:
                 self._sock.close()
+        except Exception:
+            pass
+        # v9.19: 主动关闭 UDP 发现 socket（否则后台线程要等 recvfrom 超时）
+        try:
+            if self._udp_sock:
+                self._udp_sock.close()
         except Exception:
             pass
         for sock in list(self._clients.values()):
@@ -153,11 +167,12 @@ class RoomServer:
         except Exception:
             pass
         finally:
-            # 清理断开的客户端
+            # 清理断开的客户端（v9.19: 连带删除发送锁）
             with self._lock:
                 for pid, sock in list(self._clients.items()):
                     if sock is conn:
                         del self._clients[pid]
+                        self._client_locks.pop(pid, None)
                         self.members.pop(pid, None)
                         break
             self._broadcast_members()
@@ -166,6 +181,14 @@ class RoomServer:
     def _dispatch(self, conn, msg):
         mtype = msg.get("type")
         if mtype == "join":
+            # v9.19: 重复 join 拒绝（防幽灵成员）
+            if self._pid_of(conn) is not None:
+                self._send(conn, {"type": "join_rejected", "reason": "重复加入"})
+                return
+            # v9.19: 非 waiting/ready 状态拒绝加入（防中途扰乱同步）
+            if self.state not in (ROOM_WAITING, ROOM_READY):
+                self._send(conn, {"type": "join_rejected", "reason": "游戏已在同步或进行中"})
+                return
             name = str(msg.get("name", "玩家"))[:16]
             code = str(msg.get("room_code", "")).upper()
             if code and code != self.room_code:
@@ -179,6 +202,7 @@ class RoomServer:
                 pid = self._next_pid
                 self._next_pid += 1
                 self._clients[pid] = conn
+                self._client_locks[pid] = threading.Lock()
                 self.members[pid] = {"player_id": pid, "name": name, "ready": False,
                                      "ip": str(msg.get("ip", "")), "is_host": False}
             self._send(conn, {"type": "joined", "player_id": pid,
@@ -208,19 +232,28 @@ class RoomServer:
         return None
 
     def _update_state(self):
-        """全员 ready → ROOM_READY"""
+        """全员 ready → ROOM_READY（v9.19: 房主必须 ready + 单人房间可自测）"""
         with self._lock:
+            host_ready = self.members.get(0, {}).get("ready", False)
             non_host = [m for pid, m in self.members.items() if not m.get("is_host")]
-            if non_host and all(m.get("ready") for m in non_host):
+            # 房主必须准备；若有其他成员，其他成员也必须全部准备
+            if host_ready and (len(non_host) == 0 or all(m.get("ready") for m in non_host)):
                 self.state = ROOM_READY
             else:
                 self.state = ROOM_WAITING
         self._emit("state_changed", {"state": self.state})
 
     # ---------------- 发送 ----------------
-    def _send(self, sock, msg):
+    def _send(self, sock, msg, pid=None):
+        """发送 JSON 行（v9.19: 每连接独立锁防并发写切碎 TCP 流）"""
         try:
-            sock.sendall(json.dumps(msg, ensure_ascii=False).encode("utf-8") + b"\n")
+            data = json.dumps(msg, ensure_ascii=False).encode("utf-8") + b"\n"
+            lock = self._client_locks.get(pid) if pid is not None else None
+            if lock:
+                with lock:
+                    sock.sendall(data)
+            else:
+                sock.sendall(data)
         except Exception:
             pass
 
@@ -228,13 +261,13 @@ class RoomServer:
         with self._lock:
             for pid, sock in list(self._clients.items()):
                 if pid != exclude:
-                    self._send(sock, msg)
+                    self._send(sock, msg, pid)
 
     def send_to(self, pid, msg):
         with self._lock:
             sock = self._clients.get(pid)
         if sock:
-            self._send(sock, msg)
+            self._send(sock, msg, pid)
 
     def _broadcast_members(self):
         self.broadcast({"type": "members", "members": list(self.members.values()),
@@ -423,15 +456,18 @@ class RoomClient:
                                "sha256": msg.get("sha256", ""), "size": int(msg.get("size", 0))}
             self._emit("save_start", msg)
         elif mtype == "save_chunk":
-            idx = int(msg.get("index", 0))
+            idx = int(msg.get("index", -1))
             data = msg.get("data", "")
-            try:
-                self._save_chunks[idx] = base64.b64decode(data)
-            except Exception:
-                pass
             total = int(msg.get("total", 0))
-            if len(self._save_chunks) >= total:
-                self._assemble_save()
+            # v9.19: 边界校验（防非法 index 导致提前组装/错位）
+            if 0 <= idx < total:
+                try:
+                    self._save_chunks[idx] = base64.b64decode(data)
+                except Exception:
+                    pass
+            if total > 0 and len(self._save_chunks) == total:
+                if set(self._save_chunks.keys()) == set(range(total)):
+                    self._assemble_save()
         elif mtype == "save_sync_done":
             self._emit("save_done", msg)
         elif mtype == "start_game":
@@ -456,13 +492,16 @@ class RoomClient:
         self._send({"type": "ready", "ready": ready})
 
     def save_to(self, saves_dir):
-        """把收到的存档写入 Saves 目录"""
+        """把收到的存档写入 Saves 目录（v9.19: 防路径遍历——只取 basename + .save 白名单）"""
         if self._save_file is None:
             return False, "无存档数据"
         try:
             os.makedirs(saves_dir, exist_ok=True)
-            filename = getattr(self, "_save_meta", {}).get("filename", "Slot_00000001.save")
-            path = os.path.join(saves_dir, filename)
+            raw_name = getattr(self, "_save_meta", {}).get("filename", "")
+            safe_name = os.path.basename(raw_name.replace("\\", "/"))
+            if not safe_name.endswith(".save") or ".." in safe_name:
+                safe_name = "Slot_00000001.save"
+            path = os.path.join(saves_dir, safe_name)
             if os.path.exists(path):
                 os.replace(path, path + ".bak")
             with open(path, "wb") as f:
