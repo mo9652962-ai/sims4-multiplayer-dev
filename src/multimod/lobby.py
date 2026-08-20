@@ -28,6 +28,7 @@ import random  # v9.4: 重连退避 jitter（研究: 防 thundering herd）
 import socket
 import time
 import threading
+import hmac as _hmac_mod  # v9.25: 密码时序安全比对
 
 import sims4.commands
 
@@ -77,6 +78,7 @@ def add_chat(from_name, text):
     except Exception:
         pass
 ROOM_PASSWORD = ""           # private 房间的加入密码（4-8 位）
+MAX_PLAYERS = 8              # v9.25: 房间人数上限（防恶意握手内存膨胀）
 
 
 def _gen_room_code():
@@ -266,9 +268,19 @@ def add_host_self(visibility="public", password=""):
 def on_hello(player_id, name, ip):
     """客户端发来 hello → 加入成员列表 + 广播"""
     global _members
+    # v9.25: 房间人数上限（防恶意握手内存膨胀/广播风暴）
+    if player_id not in _members and len(_members) >= MAX_PLAYERS:
+        network._log("lobby: room full, rejected {}".format(player_id))
+        if network._client_socket is not None:
+            network._send_json(network._client_socket,
+                               {"type": "join_rejected", "reason": "room_full"})
+        return
+    # v9.25: 昵称清洗（长度 16 + 去控制字符——防刷屏/富文本混淆）
+    clean_name = (name or "").strip()[:16]
+    clean_name = "".join(c for c in clean_name if c.isprintable() and ord(c) >= 32)
     _members[player_id] = {
         "player_id": player_id,
-        "name": name or "玩家{}".format(player_id),
+        "name": clean_name or "玩家{}".format(player_id),
         "ip": ip or "",
         "ready": False,
         "in_lot": False,
@@ -405,10 +417,24 @@ def host_send_save_file(filename):
 _recv_save_cache = {}
 
 
+def _safe_save_filename(filename):
+    """v9.25: 存档文件名安全校验（防路径穿越——../../ 任意文件写入 RCE）"""
+    if not filename:
+        return None
+    name = os.path.basename(str(filename).replace("\\", "/"))
+    if not (name.endswith(".save") or name.endswith(".save.bak")):
+        network._log("lobby: invalid save filename rejected: {}".format(name))
+        return None
+    return name
+
+
 def _resend_save_chunks(filename, missing_indices):
     """v9.5: 房主重发缺失存档块（研究: MAVLink FTP missing chunks re-request）"""
     try:
         import base64
+        filename = _safe_save_filename(filename)
+        if filename is None:
+            return
         path = os.path.join(SAVES_DIR, filename)
         if not os.path.exists(path):
             network._log("lobby: resend failed, save missing {}".format(path))
@@ -432,7 +458,9 @@ def _resend_save_chunks(filename, missing_indices):
 def on_save_chunk(data):
     """客户端收到存档块 → 缓存"""
     global _recv_save_cache
-    filename = data.get("filename", "")
+    filename = _safe_save_filename(data.get("filename", ""))
+    if filename is None:
+        return
     index = data.get("index", 0)
     total = data.get("total", 1)
     chunk = data.get("data", "")
@@ -456,7 +484,9 @@ def on_save_chunk_done(data):
     try:
         import base64
         import hashlib
-        filename = data.get("filename", "")
+        filename = _safe_save_filename(data.get("filename", ""))
+        if filename is None:
+            return
         if filename not in _recv_save_cache:
             return
         cache = _recv_save_cache[filename]
@@ -1409,7 +1439,10 @@ def process_message(data, sender_pid=None):
                                               "host_ver": network.PROTO_VERSION})
                     return
                 # 私密房间密码验证（十轮研究: flackr/lobby private with codes）
-                if ROOM_VISIBILITY == "private" and password != ROOM_PASSWORD:
+                # v9.25: hmac.compare_digest 防时序侧信道
+                if ROOM_VISIBILITY == "private" and not _hmac_mod.compare_digest(
+                    str(password or ""), str(ROOM_PASSWORD)
+                ):
                     network._log("lobby: join rejected (bad password) from {}".format(ip))
                     sock = network._clients[sender_pid][0]
                     network._send_json(sock, {"type": "join_rejected", "reason": "房间密码错误"})
@@ -1532,6 +1565,12 @@ def process_message(data, sender_pid=None):
             # 主机收到客户端进图状态
             if network._is_host and sender_pid is not None:
                 on_in_lot(sender_pid, data.get("in_lot", False))
+            return
+
+        if mtype == "travel_ack":
+            # v9.25: 房主收到客机旅行确认（此前缺失——auto-ack 白发, 每局等 10s 超时兜底）
+            if network._is_host and sender_pid is not None:
+                on_travel_ack(sender_pid)
             return
 
         if mtype == "travel_arrived":
