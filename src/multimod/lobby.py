@@ -474,7 +474,13 @@ def _resend_save_chunks(filename, missing_indices):
 
 
 def on_save_chunk(data):
-    """客户端收到存档块 → 缓存"""
+    """客户端收到存档块 → 缓存
+
+    v9.28: Gemini 安全复审——接收端块校验：
+      - index/total 范围校验（防恶意 total 巨大导致 done 时 missing 列表爆炸）
+      - chunk 数据长度上限（防超 64KB 块塞满内存）
+      - 重复块幂等（重放只覆盖同 index，无副作用）
+    """
     global _recv_save_cache
     filename = _safe_save_filename(data.get("filename", ""))
     if filename is None:
@@ -482,6 +488,19 @@ def on_save_chunk(data):
     index = data.get("index", 0)
     total = data.get("total", 1)
     chunk = data.get("data", "")
+    # v9.28: 块序号范围校验（恶意端 total=0 或超大 → 直接丢弃）
+    try:
+        index = int(index)
+        total = int(total)
+    except (TypeError, ValueError):
+        return
+    if total <= 0 or total > 20000 or index < 0 or index >= total:
+        network._log("lobby: save chunk rejected idx={} total={}".format(index, total))
+        return
+    # v9.28: 块数据长度上限（SAVE_CHUNK_SIZE=64KB；允许 1.2 倍余量防 base64 边界）
+    if len(chunk) > SAVE_CHUNK_SIZE * 3 // 2:
+        network._log("lobby: save chunk oversized ({}B), rejected".format(len(chunk)))
+        return
     if filename not in _recv_save_cache:
         _recv_save_cache[filename] = {"chunks": {}, "total": total}
     _recv_save_cache[filename]["chunks"][index] = chunk
