@@ -43,6 +43,7 @@ LOBBY_STATE_PATH = network.LOBBY_STATE_PATH
 _members = {}
 _save_sync_phase = "idle"   # idle | waiting_ack | done
 _state_lock = threading.Lock()  # v9.11: state 文件写锁（并发写安全）
+_members_lock = threading.Lock()  # v9.26: 成员 dict 检查-修改原子化（Gemini 架构审查 #3）
 _save_sync_acks = set()
 _start_granted = False       # 存档同步完成后所有成员获得开始权
 _player_name = "玩家"
@@ -234,14 +235,28 @@ def on_client_connected(player_id, addr):
 
 
 def on_client_disconnect(player_id):
-    """客户端断开 → 移除成员 + 广播"""
-    global _members
-    if player_id in _members:
-        name = _members[player_id].get("name", "?")
-        del _members[player_id]
-        network._log("lobby: {} left the room".format(name))
-        _notify("{} 离开了房间".format(name))
-        _broadcast_state()
+    """客户端断开 → 移除成员 + 级联清理（v9.26: 补 travel/存档缓存——防悬挂等待）"""
+    global _members, _travel_acks, _recv_save_cache
+    with _members_lock:  # v9.26: 检查-修改原子化
+        if player_id in _members:
+            name = _members[player_id].get("name", "?")
+            del _members[player_id]
+            network._log("lobby: {} left the room".format(name))
+            _notify("{} 离开了房间".format(name))
+            _broadcast_state()
+    # v9.26: 级联清理（Gemini 架构审查 #4——离线级联结算）
+    # 1. 旅行等待集剔除该成员——否则 len(travel_acks)==len(members) 永远不满足
+    if player_id in _travel_acks:
+        _travel_acks.discard(player_id)
+        network._log("lobby: travel_acks cleaned for {}".format(player_id))
+        # 若剩下的成员已全部确认 → 继续推进旅行（复用 on_travel_ack 判定）
+        try:
+            if _travel_acks.issuperset(set(_members.keys())):
+                _travel_force_start()
+        except Exception:
+            pass
+    # 2. 存档接收缓存清空（防内存泄漏 + 历史数据污染下次同步）
+    _recv_save_cache.clear()
 
 
 def add_host_self(visibility="public", password=""):
@@ -268,28 +283,31 @@ def add_host_self(visibility="public", password=""):
 def on_hello(player_id, name, ip):
     """客户端发来 hello → 加入成员列表 + 广播"""
     global _members
-    # v9.25: 房间人数上限（防恶意握手内存膨胀/广播风暴）
-    if player_id not in _members and len(_members) >= MAX_PLAYERS:
-        network._log("lobby: room full, rejected {}".format(player_id))
-        if network._client_socket is not None:
-            network._send_json(network._client_socket,
-                               {"type": "join_rejected", "reason": "room_full"})
-        return
-    # v9.25: 昵称清洗（长度 16 + 去控制字符——防刷屏/富文本混淆）
-    clean_name = (name or "").strip()[:16]
-    clean_name = "".join(c for c in clean_name if c.isprintable() and ord(c) >= 32)
-    _members[player_id] = {
-        "player_id": player_id,
-        "name": clean_name or "玩家{}".format(player_id),
-        "ip": ip or "",
-        "ready": False,
-        "in_lot": False,
-        "is_host": False,
-        "online": True,
-        "last_seen": time.time(),
-    }
-    network._log("lobby: {} joined room".format(_members[player_id]["name"]))
-    _notify("{} 加入了房间".format(_members[player_id]["name"]))
+    # v9.26: 成员 dict 检查-修改原子化（socket 线程 vs 主线程竞态——Gemini 架构审查 #3）
+    with _members_lock:
+        # v9.25: 房间人数上限（防恶意握手内存膨胀/广播风暴）
+        if player_id not in _members and len(_members) >= MAX_PLAYERS:
+            network._log("lobby: room full, rejected {}".format(player_id))
+            if network._client_socket is not None:
+                network._send_json(network._client_socket,
+                                   {"type": "join_rejected", "reason": "room_full"})
+            return
+        # v9.25: 昵称清洗（长度 16 + 去控制字符——防刷屏/富文本混淆）
+        clean_name = (name or "").strip()[:16]
+        clean_name = "".join(c for c in clean_name if c.isprintable() and ord(c) >= 32)
+        _members[player_id] = {
+            "player_id": player_id,
+            "name": clean_name or "玩家{}".format(player_id),
+            "ip": ip or "",
+            "ready": False,
+            "in_lot": False,
+            "is_host": False,
+            "online": True,
+            "last_seen": time.time(),
+        }
+        joined_name = _members[player_id]["name"]
+    network._log("lobby: {} joined room".format(joined_name))
+    _notify("{} 加入了房间".format(joined_name))
     _broadcast_state()
 
 
@@ -669,7 +687,7 @@ def on_host_disconnect():
         my_pid = network._my_player_id
         if not candidates:
             return
-        # 写竞选 claim（自己的 player_id + 时间戳 + 已知成员）
+        # 写竞选 claim（自己的 player_id + 时间戳 + 已知成员 + 房间设置）
         claim = {
             "my_player_id": my_pid,
             "my_name": _get_player_name(),
@@ -677,6 +695,10 @@ def on_host_disconnect():
             "candidates": [c["player_id"] for c in candidates],
             "candidate_names": {c["player_id"]: c["name"] for c in candidates},
             "host_ip": _last_known_host_ip,
+            # v9.26: 迁移时保留房间设置（防 private 密码丢失）
+            "room_code": ROOM_CODE,
+            "visibility": ROOM_VISIBILITY,
+            "password": ROOM_PASSWORD,
         }
         with open(MIGRATION_CLAIM_PATH, "w", encoding="utf-8") as f:
             json.dump(claim, f, ensure_ascii=False)
@@ -729,10 +751,10 @@ def _become_new_host(claim):
     try:
         network._is_host = True
         network._my_player_id = 0
-        # 重建房间（保留原房间码？重新生成更安全）
-        ROOM_CODE = _gen_room_code()
-        ROOM_VISIBILITY = "public"
-        ROOM_PASSWORD = ""
+        # v9.26: 重建房间——保留原房间设置（private 密码/可见性），仅房主本人更换
+        ROOM_CODE = claim.get("room_code") or _gen_room_code()
+        ROOM_VISIBILITY = claim.get("visibility", "public")
+        ROOM_PASSWORD = claim.get("password", "")
         _members = {
             0: {
                 "player_id": 0,
