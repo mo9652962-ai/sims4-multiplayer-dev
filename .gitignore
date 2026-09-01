@@ -38,3 +38,7 @@ Thumbs.db
 # 测试运行时产生的状态文件（v9.21）
 tools/mp_state_v9*.json
 tools/mp_lobby_state*.json
+
+# 备份文件（不入版本库，本地保留可回滚）
+*.bak*
+*.old
