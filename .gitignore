@@ -42,3 +42,13 @@ tools/mp_lobby_state*.json
 # 备份文件（不入版本库，本地保留可回滚）
 *.bak*
 *.old
+
+# 版权风险（永不入库）：反编译的游戏 API / S4MP 参考 / 解密 key
+# 本地仅作开发对照，公开渠道一律不分发；需要时可用 uncompyle6 重新生成
+docs/api/
+docs/api_probe/
+docs/cheat_service.py
+docs/s4mp_ref/
+python/base/
+python/core/
+python/simulation/
