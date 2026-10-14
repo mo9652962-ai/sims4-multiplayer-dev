@@ -199,6 +199,7 @@ uncompyle6.exe simulation/services/cheat_service.pyc > out.py
 
 - **开源许可证**：本项目基于 [GNU GPL v3.0](LICENSE) 开源发布（仅供学习研究）。
 - **安全政策**：详见 [SECURITY.md](SECURITY.md)。
+- **隐私政策**：详见 [PRIVACY.md](PRIVACY.md)（本地优先 · 零遥测）。
 
 ---
 
